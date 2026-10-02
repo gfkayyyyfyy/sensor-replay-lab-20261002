@@ -42,6 +42,24 @@ JSONL_ROWS = [
 
 EXPECTED_KEYS = {"timestamp_ms", "elapsed_ms", "temperature", "humidity"}
 
+GAP_FLAG = "--gap-threshold-ms"
+
+GAP_KEYS = EXPECTED_KEYS | {"missing_before"}
+
+# 缺测标记验收数据（乱序且含重复时间戳；gap.csv 同内容）。
+GAP_ROWS = [
+    "4000,23,58",
+    "1500,21,56",
+    "500,20,55",
+    "1500,22,57",
+]
+GAP_JSONL_ROWS = [
+    {"timestamp_ms": 4000, "temperature": 23, "humidity": 58},
+    {"timestamp_ms": 1500, "temperature": 21, "humidity": 56},
+    {"timestamp_ms": 500, "temperature": 20, "humidity": 55},
+    {"timestamp_ms": 1500, "temperature": 22, "humidity": 57},
+]
+
 
 def run_replay(
     path: Path, *extra_args: str, data_format: str = "csv"
@@ -119,26 +137,37 @@ class ReplayCliTestCase(unittest.TestCase):
         return run_replay(path, *extra_args, data_format="jsonl")
 
     @staticmethod
-    def parse_json_lines(stdout: str) -> list[dict]:
-        """逐行解析 JSON Lines，并校验每行仅含四个数值字段。"""
+    def parse_json_lines(
+        stdout: str, expected_keys: set[str] = EXPECTED_KEYS
+    ) -> list[dict]:
+        """逐行解析 JSON Lines，并校验每行字段集合与字段类型。
+
+        默认每行仅含四个数值字段；缺测标记测试传入 GAP_KEYS，此时
+        missing_before 必须是布尔值。
+        """
         records = []
         for line in stdout.splitlines():
             record = json.loads(line)
             assert isinstance(record, dict)
-            assert set(record.keys()) == EXPECTED_KEYS
-            for value in record.values():
-                assert isinstance(value, (int, float))
-                assert not isinstance(value, bool)
+            assert set(record.keys()) == expected_keys
+            for key, value in record.items():
+                if key == "missing_before":
+                    assert isinstance(value, bool)
+                else:
+                    assert isinstance(value, (int, float))
+                    assert not isinstance(value, bool)
             records.append(record)
         return records
 
     def assert_success(
-        self, result: subprocess.CompletedProcess
+        self,
+        result: subprocess.CompletedProcess,
+        expected_keys: set[str] = EXPECTED_KEYS,
     ) -> list[dict]:
         """断言退出码为 0、标准错误为空，返回解析后的输出记录。"""
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertEqual(result.stderr, "")
-        return self.parse_json_lines(result.stdout)
+        return self.parse_json_lines(result.stdout, expected_keys)
 
     def assert_input_error(self, result: subprocess.CompletedProcess) -> None:
         """断言退出码为 2、标准输出为空、标准错误非空且无堆栈。"""
@@ -313,6 +342,198 @@ class TestInvalidBounds(ReplayCliTestCase):
 
     def test_start_greater_than_end(self) -> None:
         self.assert_bound_rejected("--start-ms", "2000", "--end-ms", "1000")
+
+
+class TestGapThresholdCsv(ReplayCliTestCase):
+    """--gap-threshold-ms 缺测标记（CSV）。"""
+
+    def test_acceptance_full_range(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path, GAP_FLAG, "1000")
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+        self.assertEqual(
+            [r["temperature"] for r in records], [20, 21, 22, 23]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+
+    def test_acceptance_interval_1500_4000(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path, GAP_FLAG, "1000", "--start-ms", "1500", "--end-ms", "4000"
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [1500, 1500, 4000]
+        )
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 0, 2500])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_equal_threshold_and_duplicates_are_false(self) -> None:
+        # 差值恰好等于阈值与重复时间戳都不算缺测。
+        path = self.write_csv(
+            [
+                HEADER,
+                "0,1,1",
+                "5,2,2",
+                "5,3,3",
+                "10,4,4",
+            ]
+        )
+        result = run_replay(path, GAP_FLAG, "5")
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, False],
+        )
+
+    def test_first_output_record_always_false(self) -> None:
+        # 区间把更早的样本排除后，首条选中记录仍固定为 false：
+        # 判定不参考区间外样本与区间端点。
+        path = self.write_data_csv()
+        result = run_replay(
+            path, GAP_FLAG, "100", "--start-ms", "2000", "--end-ms", "3000"
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [2000, 3000]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, True]
+        )
+
+    def test_leading_zeros_accepted(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path, GAP_FLAG, "01000")
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+
+    def test_no_flag_keeps_four_fields(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path)
+        records = self.assert_success(result, EXPECTED_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+
+    def test_empty_interval_with_flag_is_silent_success(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path, GAP_FLAG, "1000", "--start-ms", "9000", "--end-ms", "9999"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_header_only_with_flag_is_silent_success(self) -> None:
+        path = self.write_csv([HEADER])
+        result = run_replay(path, GAP_FLAG, "1000")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+
+class TestInvalidGapThreshold(ReplayCliTestCase):
+    """--gap-threshold-ms 非法取值：退出码 2、空标准输出、错误点名该参数。"""
+
+    def assert_gap_rejected(self, value: str | None) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        args = [GAP_FLAG] if value is None else [GAP_FLAG, value]
+        result = run_replay(path, *args)
+        self.assert_input_error(result)
+        self.assertIn("--gap-threshold-ms", result.stderr)
+
+    def test_missing_value(self) -> None:
+        self.assert_gap_rejected(None)
+
+    def test_empty_string(self) -> None:
+        self.assert_gap_rejected("")
+
+    def test_zero_rejected(self) -> None:
+        self.assert_gap_rejected("0")
+        self.assert_gap_rejected("00")
+        self.assert_gap_rejected("0000")
+
+    def test_signed(self) -> None:
+        self.assert_gap_rejected("+1")
+        self.assert_gap_rejected("-1")
+
+    def test_decimal_exponent(self) -> None:
+        self.assert_gap_rejected("1.0")
+        self.assert_gap_rejected("1.5")
+        self.assert_gap_rejected("1e3")
+        self.assert_gap_rejected("2E3")
+
+    def test_whitespace_and_other_non_digits(self) -> None:
+        self.assert_gap_rejected(" 1")
+        self.assert_gap_rejected("1 ")
+        self.assert_gap_rejected("1 0")
+        self.assert_gap_rejected("abc")
+        self.assert_gap_rejected("0x1")
+        self.assert_gap_rejected("1_0")
+
+    def test_equals_form_rejected(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path, "--gap-threshold-ms=0")
+        self.assert_input_error(result)
+        self.assertIn("--gap-threshold-ms", result.stderr)
+
+    def test_invalid_file_still_validates_first(self) -> None:
+        # 阈值合法但区间外存在非法记录：整次回放失败并给出原有定位。
+        path = self.write_csv(
+            [HEADER, *GAP_ROWS, "9000,NaN,70"]
+        )
+        result = run_replay(
+            path, GAP_FLAG, "1000", "--start-ms", "500", "--end-ms", "4000"
+        )
+        self.assert_input_error(result)
+        self.assertIn("第 6 条 CSV 记录", result.stderr)
+
+
+class TestGapThresholdJsonl(ReplayCliTestCase):
+    """--gap-threshold-ms 在 JSONL 下与 CSV 结果一致。"""
+
+    def test_acceptance_full_range(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        result = self.run_jsonl(path, GAP_FLAG, "1000")
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+        self.assertEqual(
+            [r["temperature"] for r in records], [20, 21, 22, 23]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+
+    def test_acceptance_interval(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        result = self.run_jsonl(
+            path, GAP_FLAG, "1000", "--start-ms", "1500", "--end-ms", "4000"
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 0, 2500])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_no_flag_keeps_four_fields(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        result = self.run_jsonl(path)
+        records = self.assert_success(result, EXPECTED_KEYS)
+        self.assertEqual(len(records), 4)
 
 
 class TestJsonlIntervalReplay(ReplayCliTestCase):
