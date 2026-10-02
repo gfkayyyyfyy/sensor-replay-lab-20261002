@@ -6,6 +6,8 @@
 以退出码 2 结束。
 
 输入格式由 ``--format csv|jsonl`` 显式选择（默认 csv），不按文件扩展名推断。
+可选的 ``--gap-threshold-ms MS`` 为每条输出记录增加布尔字段 missing_before，
+标记当前记录与上一条输出记录的 timestamp_ms 差值是否严格大于阈值。
 """
 
 from __future__ import annotations
@@ -77,11 +79,13 @@ def replay_csv_text(
     text: str,
     start_ms: int | None = None,
     end_ms: int | None = None,
+    gap_threshold_ms: int | None = None,
 ) -> str:
     """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。
 
     start_ms/end_ms 为可选的 timestamp_ms 闭区间端点；省略的一端不限制。
     先校验全部记录（区间外的非法数据同样使输入失败），再按区间筛选。
+    gap_threshold_ms 为可选的缺测标记阈值（毫秒，大于零的整数）。
     """
     reader = csv.reader(io.StringIO(text, newline=""))
 
@@ -116,7 +120,7 @@ def replay_csv_text(
         humidity = parse_number(row[hum_idx], "humidity", record_no)
         records.append((timestamp_ms, temperature, humidity))
 
-    return render_records(records, start_ms, end_ms)
+    return render_records(records, start_ms, end_ms, gap_threshold_ms)
 
 
 # 向后兼容的别名：既有调用方使用 replay_text 表示 CSV 回放。
@@ -256,12 +260,14 @@ def replay_jsonl_text(
     text: str,
     start_ms: int | None = None,
     end_ms: int | None = None,
+    gap_threshold_ms: int | None = None,
 ) -> str:
     """解析 JSON Lines 文本并返回 JSON Lines 输出字符串。
 
     先逐行校验整个文件（区间外的非法记录同样使整次回放失败），再按时间
     区间筛选。物理行号从 1 开始且空白行也计数；忽略仅含空白的行；末行
     可以没有换行符。空文件或仅含空白行时正常返回空字符串。
+    gap_threshold_ms 为可选的缺测标记阈值（毫秒，大于零的整数）。
     """
     records: list[tuple[int, int | float, int | float]] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
@@ -269,15 +275,22 @@ def replay_jsonl_text(
             continue
         records.append(parse_jsonl_line(line, line_no))
 
-    return render_records(records, start_ms, end_ms)
+    return render_records(records, start_ms, end_ms, gap_threshold_ms)
 
 
 def render_records(
     records: list[tuple[int, int | float, int | float]],
     start_ms: int | None,
     end_ms: int | None,
+    gap_threshold_ms: int | None = None,
 ) -> str:
-    """区间筛选、稳定排序并序列化为 JSON Lines；无命中时返回空字符串。"""
+    """区间筛选、稳定排序并序列化为 JSON Lines；无命中时返回空字符串。
+
+    gap_threshold_ms 不为 None 时，每条输出在原有四个字段之外追加布尔
+    字段 missing_before：当前记录与上一条输出记录的 timestamp_ms 差值
+    严格大于阈值时为 true；首条记录、差值恰好等于阈值及重复时间戳均为
+    false。判定只依据筛选并排序后的相邻输出记录，区间外样本不参与。
+    """
     # 按时间区间筛选（闭区间，两端包含）；只选原始样本，不插值。
     if start_ms is not None:
         records = [r for r in records if r[0] >= start_ms]
@@ -293,6 +306,7 @@ def render_records(
     first_timestamp = records[0][0]
 
     output = io.StringIO()
+    previous_timestamp: int | None = None
     for timestamp_ms, temperature, humidity in records:
         line = {
             "timestamp_ms": timestamp_ms,
@@ -300,8 +314,14 @@ def render_records(
             "temperature": temperature,
             "humidity": humidity,
         }
+        if gap_threshold_ms is not None:
+            line["missing_before"] = (
+                previous_timestamp is not None
+                and timestamp_ms - previous_timestamp > gap_threshold_ms
+            )
         output.write(json.dumps(line, separators=(",", ":")))
         output.write("\n")
+        previous_timestamp = timestamp_ms
     return output.getvalue()
 
 
@@ -346,6 +366,17 @@ def build_parser() -> argparse.ArgumentParser:
             "省略表示不限制上界。仅接受非负十进制整数"
         ),
     )
+    parser.add_argument(
+        "--gap-threshold-ms",
+        metavar="MS",
+        default=None,
+        help=(
+            "可选的采样间隔缺测标记阈值（毫秒）：为每条输出追加布尔字段 "
+            "missing_before，当前记录与上一条输出记录的 timestamp_ms 差值"
+            "严格大于 MS 时为 true，首条记录固定为 false。仅接受大于零的"
+            "十进制整数（允许前导零）"
+        ),
+    )
     return parser
 
 
@@ -357,6 +388,22 @@ def parse_bound(token: str, option: str) -> int:
             f"指数或空白）: {token!r}"
         )
     return int(token)
+
+
+def parse_gap_threshold(token: str) -> int:
+    """校验 --gap-threshold-ms 取值：仅 ASCII 数字组成且大于零的十进制整数。"""
+    if not _TIMESTAMP_RE.match(token):
+        raise InputError(
+            "--gap-threshold-ms 参数非法（需大于零的十进制整数，不接受符号、"
+            f"小数、指数或空白）: {token!r}"
+        )
+    value = int(token)
+    if value == 0:
+        raise InputError(
+            "--gap-threshold-ms 参数非法（需大于零的十进制整数，"
+            f"不接受零）: {token!r}"
+        )
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -372,6 +419,11 @@ def main(argv: list[str] | None = None) -> int:
         end_ms = (
             parse_bound(args.end_ms, "--end-ms")
             if args.end_ms is not None
+            else None
+        )
+        gap_threshold_ms = (
+            parse_gap_threshold(args.gap_threshold_ms)
+            if args.gap_threshold_ms is not None
             else None
         )
         if (
@@ -413,9 +465,13 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.format == "jsonl":
-            output = replay_jsonl_text(text, start_ms, end_ms)
+            output = replay_jsonl_text(
+                text, start_ms, end_ms, gap_threshold_ms
+            )
         else:
-            output = replay_csv_text(text, start_ms, end_ms)
+            output = replay_csv_text(
+                text, start_ms, end_ms, gap_threshold_ms
+            )
     except InputError as exc:
         if exc.line is not None:
             location = f"第 {exc.line} 行: "

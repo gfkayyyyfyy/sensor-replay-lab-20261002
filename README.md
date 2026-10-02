@@ -14,7 +14,7 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
@@ -30,6 +30,14 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
   两者可单独使用，省略的一端表示不限制；全部省略时保持全量回放。
   取值只接受非负十进制整数（允许前导零，不接受符号、小数、指数或空白）。
   区间外的非法数据不会被忽略，仍使整个输入失败。
+- `--gap-threshold-ms MS`：可选的**采样间隔缺测标记**。启用时每条输出在原有
+  四个字段之外追加布尔字段 `missing_before`：当前记录与上一条输出记录的
+  `timestamp_ms` 差值**严格大于**阈值时为 `true`，否则为 `false`；首条输出
+  记录固定为 `false`，差值恰好等于阈值或重复时间戳也为 `false`。判定只依据
+  区间筛选并稳定排序后的相邻输出记录，区间外样本与区间端点不参与；标记不
+  增减记录，也不改变温湿度数值与 `elapsed_ms` 的零点。
+  取值只接受**大于零**的十进制整数（允许前导零，不接受零、符号、小数、
+  指数或空白）。省略该选项时输出保持原有四个字段。
 - 查看帮助：
 
   ```bash
@@ -68,10 +76,12 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
 - 按 `timestamp_ms` 升序回放；时间戳重复时保留全部记录，并维持它们在源文件中的先后顺序（稳定排序）。
 - 使用**演示时钟立即回放**：排序后第一条样本的回放时间为零，后续样本按其时间戳与首条样本的差值推进，即 `elapsed_ms = timestamp_ms - 首条时间戳`。指定区间时，零点为**选中记录**的最早时间戳，而非参数起点或被排除的样本。
 - 没有样本落入区间时正常结束：标准输出为空，退出码 `0`。
-- 标准输出逐行输出 JSON（JSON Lines），每行只含四个数值字段：
+- 标准输出逐行输出 JSON（JSON Lines），每行只含四个数值字段（启用
+  `--gap-threshold-ms` 时追加布尔字段 `missing_before`）：
 
   ```json
   {"timestamp_ms":0,"elapsed_ms":0,"temperature":19.5,"humidity":55}
+  {"timestamp_ms":0,"elapsed_ms":0,"temperature":19.5,"humidity":55,"missing_before":false}
   ```
 
 - 忠实保留每条样本的温湿度数值，不插值、不平均。
@@ -116,6 +126,19 @@ python -m sensor_replay demo.jsonl --format jsonl --start-ms 500 --end-ms 2000
 {"timestamp_ms":2000,"elapsed_ms":1000,"temperature":22,"humidity":62}
 ```
 
+缺测标记示例（相邻输出记录时间戳差值严格大于阈值时 `missing_before` 为 `true`）：
+
+```bash
+python -m sensor_replay demo.csv --gap-threshold-ms 1000
+```
+
+```json
+{"timestamp_ms":0,"elapsed_ms":0,"temperature":19.5,"humidity":55,"missing_before":false}
+{"timestamp_ms":1000,"elapsed_ms":1000,"temperature":20.5,"humidity":60,"missing_before":false}
+{"timestamp_ms":1000,"elapsed_ms":1000,"temperature":21,"humidity":61,"missing_before":false}
+{"timestamp_ms":1500,"elapsed_ms":1500,"temperature":22,"humidity":62,"missing_before":false}
+```
+
 ## 错误处理与退出码
 
 以下情况均为输入错误：**标准输出保持为空**，错误信息写入**标准错误**，进程以退出码 **`2`** 结束，不输出堆栈：
@@ -135,6 +158,7 @@ python -m sensor_replay demo.jsonl --format jsonl --start-ms 500 --end-ms 2000
 - 公共参数与文件错误：
   - `--format` 缺值或取值非法（非 `csv`/`jsonl`）；
   - `--start-ms` / `--end-ms` 缺值或格式非法（符号、小数、指数、空白、空值），或起点大于终点；
+  - `--gap-threshold-ms` 缺值或格式非法（零、符号、小数、指数、空白、空值等非大于零整数的写法）；
   - 文件不存在、是目录、无法读取，或不是有效 UTF-8 编码。
 
 CSV 数据错误会注明所在的 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条）；JSONL 错误会注明从 1 开始的**物理行号**（空白行也计数），例如：

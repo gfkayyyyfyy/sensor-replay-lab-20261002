@@ -572,6 +572,189 @@ class TestJsonlInvalidRecords(ReplayCliTestCase):
         self.assertIn("第 2 行", result.stderr)
 
 
+class TestGapThreshold(ReplayCliTestCase):
+    """--gap-threshold-ms 缺测标记：成功路径与参数校验。"""
+
+    GAP_KEYS = EXPECTED_KEYS | {"missing_before"}
+
+    # 验收数据：乱序且含重复时间戳的四条样本。
+    GAP_ROWS = [
+        "4000,23,58",
+        "1500,21,56",
+        "500,20,55",
+        "1500,22,57",
+    ]
+    GAP_JSONL = [
+        {"timestamp_ms": 4000, "temperature": 23, "humidity": 58},
+        {"timestamp_ms": 1500, "temperature": 21, "humidity": 56},
+        {"timestamp_ms": 500, "temperature": 20, "humidity": 55},
+        {"timestamp_ms": 1500, "temperature": 22, "humidity": 57},
+    ]
+
+    def write_gap_csv(self) -> Path:
+        return self.write_csv([HEADER, *self.GAP_ROWS], "gap.csv")
+
+    def parse_gap_lines(self, stdout: str) -> list[dict]:
+        """逐行解析输出，校验恰好多出布尔字段 missing_before。"""
+        records = []
+        for line in stdout.splitlines():
+            record = json.loads(line)
+            assert isinstance(record, dict)
+            assert set(record.keys()) == self.GAP_KEYS
+            assert isinstance(record["missing_before"], bool)
+            records.append(record)
+        return records
+
+    def assert_gap_success(
+        self, result: subprocess.CompletedProcess
+    ) -> list[dict]:
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        return self.parse_gap_lines(result.stdout)
+
+    def test_csv_acceptance_no_interval(self) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(path, "--gap-threshold-ms", "1000")
+        records = self.assert_gap_success(result)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+        self.assertEqual(
+            [r["temperature"] for r in records], [20, 21, 22, 23]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+
+    def test_csv_acceptance_with_interval(self) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(
+            path,
+            "--gap-threshold-ms",
+            "1000",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+        )
+        records = self.assert_gap_success(result)
+        self.assertEqual(len(records), 3)
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 0, 2500])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_jsonl_same_result(self) -> None:
+        path = self.write_jsonl_objects(self.GAP_JSONL, name="gap.jsonl")
+        result = self.run_jsonl(path, "--gap-threshold-ms", "1000")
+        records = self.assert_gap_success(result)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+        self.assertEqual(
+            [r["temperature"] for r in records], [20, 21, 22, 23]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+        result = self.run_jsonl(
+            path,
+            "--gap-threshold-ms",
+            "1000",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+        )
+        records = self.assert_gap_success(result)
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 0, 2500])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_difference_equal_to_threshold_is_false(self) -> None:
+        path = self.write_csv(
+            [HEADER, "0,1,1", "1000,2,2", "3000,3,3"], "eq.csv"
+        )
+        result = run_replay(path, "--gap-threshold-ms", "1000")
+        records = self.assert_gap_success(result)
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_single_record_is_false(self) -> None:
+        path = self.write_csv([HEADER, "500,20,55"], "one.csv")
+        result = run_replay(path, "--gap-threshold-ms", "1")
+        records = self.assert_gap_success(result)
+        self.assertEqual([r["missing_before"] for r in records], [False])
+
+    def test_leading_zeros_accepted(self) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(path, "--gap-threshold-ms", "01000")
+        records = self.assert_gap_success(result)
+        self.assertEqual(
+            [r["missing_before"] for r in records],
+            [False, False, False, True],
+        )
+
+    def test_interval_without_hits(self) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(
+            path, "--gap-threshold-ms", "1000", "--start-ms", "6000"
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_invalid_data_outside_interval_still_fails(self) -> None:
+        path = self.write_csv(
+            [HEADER, *self.GAP_ROWS, "9000,NaN,70"], "gap_bad.csv"
+        )
+        result = run_replay(
+            path, "--gap-threshold-ms", "1000", "--end-ms", "4000"
+        )
+        self.assert_input_error(result)
+        self.assertIn("第 6 条 CSV 记录", result.stderr)
+
+    def assert_threshold_rejected(self, value: str) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(path, "--gap-threshold-ms", value)
+        self.assert_input_error(result)
+        self.assertIn("--gap-threshold-ms", result.stderr)
+
+    def test_missing_value(self) -> None:
+        path = self.write_gap_csv()
+        result = run_replay(path, "--gap-threshold-ms")
+        self.assert_input_error(result)
+        self.assertIn("--gap-threshold-ms", result.stderr)
+
+    def test_zero_and_leading_zero_zero(self) -> None:
+        self.assert_threshold_rejected("0")
+        self.assert_threshold_rejected("000")
+
+    def test_empty_string(self) -> None:
+        self.assert_threshold_rejected("")
+
+    def test_signed_values(self) -> None:
+        self.assert_threshold_rejected("+100")
+        self.assert_threshold_rejected("-5")
+
+    def test_whitespace_values(self) -> None:
+        self.assert_threshold_rejected(" 100")
+        self.assert_threshold_rejected("100 ")
+
+    def test_decimal_and_exponent(self) -> None:
+        self.assert_threshold_rejected("1.5")
+        self.assert_threshold_rejected("1000.0")
+        self.assert_threshold_rejected("1e3")
+
+    def test_non_digit(self) -> None:
+        self.assert_threshold_rejected("abc")
+        self.assert_threshold_rejected("1_000")
+
+
 class TestJsonlFileAndOptionErrors(ReplayCliTestCase):
     """格式参数与文件类错误沿用退出码 2 约定。"""
 
