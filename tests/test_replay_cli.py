@@ -837,5 +837,306 @@ class TestJsonlFileAndOptionErrors(ReplayCliTestCase):
         self.assertIn("第 1 行", result.stderr)
 
 
+class TestDuplicatePolicyCsv(ReplayCliTestCase):
+    """--duplicate-policy 重复采样点保留策略（CSV）。"""
+
+    def test_acceptance_first(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path,
+            "--duplicate-policy",
+            "first",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+            GAP_FLAG,
+            "1000",
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [1500, 4000]
+        )
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 2500])
+        self.assertEqual([r["temperature"] for r in records], [21, 23])
+        self.assertEqual([r["humidity"] for r in records], [56, 58])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, True]
+        )
+
+    def test_acceptance_last(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path,
+            "--duplicate-policy",
+            "last",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+            GAP_FLAG,
+            "1000",
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [1500, 4000]
+        )
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 2500])
+        # 仅首条温湿度与 first 不同，取源文件中最后出现的 1500 记录。
+        self.assertEqual([r["temperature"] for r in records], [22, 23])
+        self.assertEqual([r["humidity"] for r in records], [57, 58])
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, True]
+        )
+
+    def test_default_is_all_and_keeps_output(self) -> None:
+        # 省略参数与显式 all 均保留全部重复记录，输出与旧版本一致。
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        for extra in ([], ["--duplicate-policy", "all"]):
+            result = run_replay(path, *extra)
+            records = self.assert_success(result)
+            self.assertEqual(
+                [r["timestamp_ms"] for r in records],
+                [500, 1500, 1500, 4000],
+            )
+            self.assertEqual(
+                [r["temperature"] for r in records], [20, 21, 22, 23]
+            )
+
+    def test_first_and_last_full_range(self) -> None:
+        path = self.write_data_csv()  # 1000 出现两次
+        result = run_replay(path, "--duplicate-policy", "first")
+        records = self.assert_success(result)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [0, 1000, 2000, 3000]
+        )
+        self.assertEqual(
+            [r["elapsed_ms"] for r in records], [0, 1000, 2000, 3000]
+        )
+        self.assertEqual(
+            [r["temperature"] for r in records], [19.5, 20.5, 22, 23]
+        )
+        result = run_replay(path, "--duplicate-policy", "last")
+        records = self.assert_success(result)
+        self.assertEqual(
+            [r["temperature"] for r in records], [19.5, 21, 22, 23]
+        )
+        self.assertEqual(
+            [r["humidity"] for r in records], [55, 61, 62, 63]
+        )
+
+    def test_duplicates_need_not_be_adjacent(self) -> None:
+        # 源文件中 1500 的两条记录被其他时间戳隔开且温湿度不同。
+        path = self.write_csv(
+            [
+                HEADER,
+                "1500,1,1",
+                "500,9,9",
+                "1500,2,2",
+                "1500,3,3",
+            ]
+        )
+        result = run_replay(path, "--duplicate-policy", "first")
+        records = self.assert_success(result)
+        self.assertEqual(
+            [(r["timestamp_ms"], r["temperature"], r["humidity"])
+             for r in records],
+            [(500, 9, 9), (1500, 1, 1)],
+        )
+        result = run_replay(path, "--duplicate-policy", "last")
+        records = self.assert_success(result)
+        self.assertEqual(
+            [(r["timestamp_ms"], r["temperature"], r["humidity"])
+             for r in records],
+            [(500, 9, 9), (1500, 3, 3)],
+        )
+
+    def test_leading_zeros_group_by_parsed_value(self) -> None:
+        # CSV 中 01500 与 1500 解析后数值相同，归入同一重复组。
+        path = self.write_csv([HEADER, "01500,21,56", "1500,22,57"])
+        result = run_replay(path, "--duplicate-policy", "first")
+        records = self.assert_success(result)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["timestamp_ms"], 1500)
+        self.assertEqual(
+            (records[0]["temperature"], records[0]["humidity"]), (21, 56)
+        )
+        result = run_replay(path, "--duplicate-policy", "last")
+        records = self.assert_success(result)
+        self.assertEqual(
+            (records[0]["temperature"], records[0]["humidity"]), (22, 57)
+        )
+
+    def test_gap_compares_final_adjacent_records(self) -> None:
+        # 去重前 500->1500 差值 1000（等于阈值）；去重后仍为相邻输出，
+        # 1500->4000 差值 2500 严格大于阈值。
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path,
+            "--duplicate-policy",
+            "first",
+            GAP_FLAG,
+            "1000",
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 4000]
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, False, True]
+        )
+
+    def test_no_gap_flag_keeps_four_fields(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        for policy in ("first", "last"):
+            result = run_replay(path, "--duplicate-policy", policy)
+            records = self.assert_success(result, EXPECTED_KEYS)
+            self.assertEqual(
+                [r["timestamp_ms"] for r in records], [500, 1500, 4000]
+            )
+
+    def test_empty_interval_and_header_only_silent(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(
+            path,
+            "--duplicate-policy",
+            "first",
+            "--start-ms",
+            "9000",
+            "--end-ms",
+            "9999",
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        header_only = self.write_csv([HEADER])
+        result = run_replay(header_only, "--duplicate-policy", "last")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_empty_csv_still_errors(self) -> None:
+        # CSV 空文件仍按原规则报错，策略参数不改变该校验。
+        path = self.write_csv([""])
+        result = run_replay(path, "--duplicate-policy", "first")
+        self.assert_input_error(result)
+        self.assertIn("第 1 条 CSV 记录", result.stderr)
+
+    def test_invalid_record_outside_interval_still_fails(self) -> None:
+        # 区间外的非法记录仍使整次回放失败：先整文件校验，再应用策略。
+        path = self.write_csv([HEADER, *GAP_ROWS, "9000,NaN,70"])
+        result = run_replay(
+            path,
+            "--duplicate-policy",
+            "last",
+            "--start-ms",
+            "500",
+            "--end-ms",
+            "4000",
+        )
+        self.assert_input_error(result)
+        self.assertIn("第 6 条 CSV 记录", result.stderr)
+
+
+class TestInvalidDuplicatePolicy(ReplayCliTestCase):
+    """--duplicate-policy 非法取值：退出码 2、空标准输出、点名该参数。"""
+
+    def assert_policy_rejected(self, *extra_args: str) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path, *extra_args)
+        self.assert_input_error(result)
+        self.assertIn("--duplicate-policy", result.stderr)
+
+    def test_missing_value(self) -> None:
+        self.assert_policy_rejected("--duplicate-policy")
+
+    def test_empty_string(self) -> None:
+        self.assert_policy_rejected("--duplicate-policy", "")
+
+    def test_equals_form_empty(self) -> None:
+        self.assert_policy_rejected("--duplicate-policy=")
+
+    def test_other_values(self) -> None:
+        for value in ("keep", "ALL", "First", "unique", "none", "avg"):
+            self.assert_policy_rejected("--duplicate-policy", value)
+
+
+class TestDuplicatePolicyJsonl(ReplayCliTestCase):
+    """--duplicate-policy 在 JSONL 下与 CSV 结果一致。"""
+
+    def test_acceptance_first(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        result = self.run_jsonl(
+            path,
+            "--duplicate-policy",
+            "first",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+            GAP_FLAG,
+            "1000",
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [1500, 4000]
+        )
+        self.assertEqual([r["elapsed_ms"] for r in records], [0, 2500])
+        self.assertEqual(
+            [(r["temperature"], r["humidity"]) for r in records],
+            [(21, 56), (23, 58)],
+        )
+        self.assertEqual(
+            [r["missing_before"] for r in records], [False, True]
+        )
+
+    def test_acceptance_last(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        result = self.run_jsonl(
+            path,
+            "--duplicate-policy",
+            "last",
+            "--start-ms",
+            "1500",
+            "--end-ms",
+            "4000",
+            GAP_FLAG,
+            "1000",
+        )
+        records = self.assert_success(result, GAP_KEYS)
+        self.assertEqual(
+            [(r["temperature"], r["humidity"]) for r in records],
+            [(22, 57), (23, 58)],
+        )
+
+    def test_default_keeps_duplicates(self) -> None:
+        path = self.write_jsonl_objects(GAP_JSONL_ROWS)
+        for extra in ([], ["--duplicate-policy", "all"]):
+            records = self.assert_success(self.run_jsonl(path, *extra))
+            self.assertEqual(
+                [r["timestamp_ms"] for r in records],
+                [500, 1500, 1500, 4000],
+            )
+
+    def test_invalid_record_outside_interval_still_fails(self) -> None:
+        path = self.write_jsonl(
+            [
+                *[json.dumps(r, separators=(",", ":")) for r in GAP_JSONL_ROWS],
+                '{"timestamp_ms":9000,"temperature":"x","humidity":1}',
+            ]
+        )
+        result = self.run_jsonl(
+            path,
+            "--duplicate-policy",
+            "first",
+            "--start-ms",
+            "500",
+            "--end-ms",
+            "4000",
+        )
+        self.assert_input_error(result)
+        self.assertIn("第 5 行", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

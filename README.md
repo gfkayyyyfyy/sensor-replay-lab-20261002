@@ -14,7 +14,7 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
@@ -43,6 +43,22 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
     不会与区间外的 500 记录比较；
   - 缺省该参数时输出仍只含原有四个数值字段；标记不增减记录，也不改写温湿度
     数值与 `elapsed_ms`（仍从首条选中记录计起）。
+- `--duplicate-policy all|first|last`：可选的**重复采样点保留策略**，默认
+  `all`（省略时等同 `all`，输出与旧版本完全一致）。重复依据为**解析后的
+  timestamp_ms 数值**——即使 CSV 字面量写法不同（`01500` 与 `1500`）、
+  记录不相邻或温湿度不同，也归入同一时间戳组：
+  - `all`：保留同一时间戳的全部样本（维持源文件先后顺序）；
+  - `first`：只保留该时间戳在**源文件中最先出现**的一条完整样本；
+  - `last`：只保留该时间戳在**源文件中最后出现**的一条完整样本；
+  - 选中的温湿度始终来自**同一条原始记录**，不平均、不拼接；
+  - 两种格式均**先按现有规则校验完整文件并完成闭区间筛选**，再在区间内
+    应用保留策略；被舍弃记录或区间外记录若非法，仍使整次回放失败（退出码
+    `2`，标准输出为空，标准错误保留原有定位，无堆栈）；
+  - 策略不改变字段集合与 `elapsed_ms`（仍从最终首条输出的时间戳计起）；
+    同时启用缺测参数时，`missing_before` 比较**去重后最终相邻的输出记录**，
+    首条固定为 `false`，差值严格大于阈值才为 `true`；
+  - 缺值、空字符串或 `all`/`first`/`last` 之外的取值均为输入错误（退出码
+    `2`，标准输出为空，错误信息点名 `--duplicate-policy`，无堆栈）。
 - 查看帮助：
 
   ```bash
@@ -78,7 +94,7 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
 
 ## 回放与输出规则
 
-- 按 `timestamp_ms` 升序回放；时间戳重复时保留全部记录，并维持它们在源文件中的先后顺序（稳定排序）。
+- 按 `timestamp_ms` 升序回放；时间戳重复时默认（`--duplicate-policy all`）保留全部记录，并维持它们在源文件中的先后顺序（稳定排序）。选择 `first`/`last` 时，同一时间戳只保留源文件中最先/最后出现的一条完整样本（语义见上文命令说明）；重复依据为解析后的时间戳数值，记录不必相邻。
 - 使用**演示时钟立即回放**：排序后第一条样本的回放时间为零，后续样本按其时间戳与首条样本的差值推进，即 `elapsed_ms = timestamp_ms - 首条时间戳`。指定区间时，零点为**选中记录**的最早时间戳，而非参数起点或被排除的样本。
 - 没有样本落入区间时正常结束：标准输出为空，退出码 `0`。
 - 标准输出逐行输出 JSON（JSON Lines），每行只含四个数值字段：
@@ -165,6 +181,33 @@ python -m sensor_replay gap.csv --gap-threshold-ms 1000 --start-ms 1500 --end-ms
 区间外的 500 记录被排除后不参与判定，首条选中记录固定为 `false`；相同记录用
 `--format jsonl` 输入得到完全相同的结果。
 
+重复采样点保留策略示例见仓库自带的 `demo.csv`（四行乱序数据，`1500` 出现两次且温湿度不同）：
+
+```bash
+python -m sensor_replay demo.csv --duplicate-policy first --start-ms 1500 --end-ms 4000 --gap-threshold-ms 1000
+```
+
+```json
+{"timestamp_ms":1500,"elapsed_ms":0,"temperature":21,"humidity":56,"missing_before":false}
+{"timestamp_ms":4000,"elapsed_ms":2500,"temperature":23,"humidity":58,"missing_before":true}
+```
+
+同一时间戳的两条 `1500` 中，`first` 保留源文件中最先出现的 `21/56`；缺测标记基于
+去重后的相邻输出记录（1500→4000 差值 2500 严格大于 1000，末条为 `true`）。把
+`first` 改为 `last` 后，仅首条记录的温湿度变为 `22/57`，其余完全相同：
+
+```bash
+python -m sensor_replay demo.csv --duplicate-policy last --start-ms 1500 --end-ms 4000 --gap-threshold-ms 1000
+```
+
+```json
+{"timestamp_ms":1500,"elapsed_ms":0,"temperature":22,"humidity":57,"missing_before":false}
+{"timestamp_ms":4000,"elapsed_ms":2500,"temperature":23,"humidity":58,"missing_before":true}
+```
+
+`elapsed_ms` 始终从最终首条输出的时间戳计起；等价 JSONL 输入显式选择
+`--format jsonl` 时结果一致。
+
 ## 错误处理与退出码
 
 以下情况均为输入错误：**标准输出保持为空**，错误信息写入**标准错误**，进程以退出码 **`2`** 结束，不输出堆栈：
@@ -187,6 +230,8 @@ python -m sensor_replay gap.csv --gap-threshold-ms 1000 --start-ms 1500 --end-ms
   - `--gap-threshold-ms` 缺值、取值为零（含 `00` 等前导零形式），或为符号、
     小数、指数、空白、空字符串及其他非 ASCII 数字写法；错误信息会点名
     `--gap-threshold-ms`；
+  - `--duplicate-policy` 缺值、空字符串或取值不在 `all`/`first`/`last` 中；
+    错误信息会点名 `--duplicate-policy`；
   - 文件不存在、是目录、无法读取，或不是有效 UTF-8 编码。
 
 CSV 数据错误会注明所在的 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条）；JSONL 错误会注明从 1 开始的**物理行号**（空白行也计数），例如：
