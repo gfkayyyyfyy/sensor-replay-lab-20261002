@@ -103,6 +103,10 @@ def replay_csv_text(
         header = next(reader)
     except StopIteration:
         raise InputError("文件为空，缺少表头", 1)
+    except csv.Error as exc:
+        # 表头算第 1 条 CSV 记录；字段超长等 csv 模块错误同样属于输入错误，
+        # 不允许以未捕获异常的形式泄漏出 Python 堆栈。
+        raise InputError(f"CSV 解析失败: {exc}", 1) from exc
 
     if len(header) != len(REQUIRED_COLUMNS) or set(header) != set(
         REQUIRED_COLUMNS
@@ -118,7 +122,19 @@ def replay_csv_text(
     hum_idx = header.index("humidity")
 
     records: list[tuple[int, int | float, int | float]] = []
-    for record_no, row in enumerate(reader, start=2):
+    # 记录序号按逻辑 CSV 记录计数（表头为第 1 条、已在上方读出，故首条
+    # 数据为第 2 条）；显式递增而不使用 reader.line_num——后者是物理行号，
+    # 引号字段跨行时会大于记录序号。区间外或重复策略本会舍弃的记录同样
+    # 经过此读取循环，字段超长等 csv.Error 仍使整个输入失败。
+    row_iter = iter(reader)
+    record_no = 2
+    while True:
+        try:
+            row = next(row_iter)
+        except StopIteration:
+            break
+        except csv.Error as exc:
+            raise InputError(f"CSV 解析失败: {exc}", record_no) from exc
         if len(row) != len(REQUIRED_COLUMNS):
             raise InputError(
                 f"数据行列数不符：应为 {len(REQUIRED_COLUMNS)} 列，"
@@ -129,6 +145,7 @@ def replay_csv_text(
         temperature = parse_number(row[temp_idx], "temperature", record_no)
         humidity = parse_number(row[hum_idx], "humidity", record_no)
         records.append((timestamp_ms, temperature, humidity))
+        record_no += 1
 
     return render_records(
         records, start_ms, end_ms, gap_threshold_ms, duplicate_policy

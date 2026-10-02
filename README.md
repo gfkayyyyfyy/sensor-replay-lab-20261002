@@ -218,6 +218,7 @@ python -m sensor_replay demo.csv --duplicate-policy last --start-ms 1500 --end-m
   - 数据行列数与表头不符；
   - `timestamp_ms` 非法（负数、小数、缺失、非数字等）；
   - `temperature` / `humidity` 缺失、无法解析，或为 `NaN`、无穷值；
+  - 底层 CSV 解析错误（`csv.Error`，如字段长度超过 `csv.field_size_limit()` 上限）：错误信息含“CSV 解析失败”，按逻辑 CSV 记录序号定位——表头算第 1 条，被双引号包裹且跨越物理行的字段也只按记录序号计数；字段长度上限与引号解析规则沿用 Python 标准库 `csv` 默认行为；
 - JSONL：
   - JSON 语法错误，或某一行不是单个 JSON 对象；
   - 对象缺键、多键或存在重复键；
