@@ -14,7 +14,7 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
@@ -43,6 +43,15 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
     不会与区间外的 500 记录比较；
   - 缺省该参数时输出仍只含原有四个数值字段；标记不增减记录，也不改写温湿度
     数值与 `elapsed_ms`（仍从首条选中记录计起）。
+- `--duplicate-policy all|first|last`：可选的**重复时间戳保留策略**，默认
+  `all`（保留全部重复记录，与既往行为一致）。`first` / `last` 分别只保留
+  同一时间戳在源文件中**最先**、**最后**出现的一条完整样本：
+  - 重复依据**解析后的 `timestamp_ms` 数值**判断——CSV 中 `01500` 与 `1500`
+    视为相同时间戳；重复记录不必相邻，温湿度不同也归入同组；
+  - 选中的温湿度来自同一原始记录，不平均、不拼接；
+  - 策略在闭区间筛选之后、稳定排序之前应用；`elapsed_ms` 仍从最终首条输出
+    记录的时间戳计起，`missing_before` 也比较最终相邻输出记录；
+  - 缺值、空字符串或其他取值均为输入错误（退出码 2，标准输出为空）。
 - 查看帮助：
 
   ```bash

@@ -11,6 +11,13 @@
 增加布尔字段 missing_before——当前记录与上一条**输出**记录的 timestamp_ms
 差值严格大于 MS 时为 true；首条输出记录固定为 false，差值恰好等于 MS 与
 重复时间戳均为 false。判定基于区间筛选并稳定排序后的相邻记录。
+
+可选的 ``--duplicate-policy all|first|last`` 选择重复时间戳保留策略：
+all（默认）保留全部重复记录；first/last 只保留同一时间戳在源文件中最先、
+最后出现的一条完整样本。重复依据解析后的 timestamp_ms 数值判断（CSV 中
+01500 与 1500 视为相同），记录不必相邻，温湿度不同也归入同组；选中的
+温湿度来自同一原始记录，不平均或拼接。策略在闭区间筛选之后、稳定排序
+之前应用。
 """
 
 from __future__ import annotations
@@ -83,11 +90,13 @@ def replay_csv_text(
     start_ms: int | None = None,
     end_ms: int | None = None,
     gap_threshold_ms: int | None = None,
+    duplicate_policy: str = "all",
 ) -> str:
     """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。
 
     start_ms/end_ms 为可选的 timestamp_ms 闭区间端点；省略的一端不限制。
     gap_threshold_ms 启用时为每条输出附加 missing_before 缺测标记。
+    duplicate_policy 选择重复时间戳保留策略（all/first/last）。
     先校验全部记录（区间外的非法数据同样使输入失败），再按区间筛选。
     """
     reader = csv.reader(io.StringIO(text, newline=""))
@@ -123,7 +132,8 @@ def replay_csv_text(
         humidity = parse_number(row[hum_idx], "humidity", record_no)
         records.append((timestamp_ms, temperature, humidity))
 
-    return render_records(records, start_ms, end_ms, gap_threshold_ms)
+    return render_records(records, start_ms, end_ms, gap_threshold_ms,
+                          duplicate_policy)
 
 
 # 向后兼容的别名：既有调用方使用 replay_text 表示 CSV 回放。
@@ -264,6 +274,7 @@ def replay_jsonl_text(
     start_ms: int | None = None,
     end_ms: int | None = None,
     gap_threshold_ms: int | None = None,
+    duplicate_policy: str = "all",
 ) -> str:
     """解析 JSON Lines 文本并返回 JSON Lines 输出字符串。
 
@@ -277,7 +288,8 @@ def replay_jsonl_text(
             continue
         records.append(parse_jsonl_line(line, line_no))
 
-    return render_records(records, start_ms, end_ms, gap_threshold_ms)
+    return render_records(records, start_ms, end_ms, gap_threshold_ms,
+                          duplicate_policy)
 
 
 def render_records(
@@ -285,8 +297,14 @@ def render_records(
     start_ms: int | None,
     end_ms: int | None,
     gap_threshold_ms: int | None = None,
+    duplicate_policy: str = "all",
 ) -> str:
-    """区间筛选、稳定排序并序列化为 JSON Lines；无命中时返回空字符串。
+    """区间筛选、重复保留、稳定排序并序列化为 JSON Lines；无命中时返回空字符串。
+
+    duplicate_policy 为 "first"/"last" 时，同一时间戳只保留源文件中最先、
+    最后出现的一条完整样本（重复依据解析后的 timestamp_ms 数值判断，记录
+    不必相邻，温湿度不同也归入同组）；"all" 保留全部重复记录。策略在区间
+    筛选之后、稳定排序之前应用。
 
     gap_threshold_ms 非 None 时为每条输出附加布尔字段 missing_before：
     依据稳定排序后的相邻输出记录，当前记录与上一条输出记录的 timestamp_ms
@@ -298,6 +316,15 @@ def render_records(
         records = [r for r in records if r[0] >= start_ms]
     if end_ms is not None:
         records = [r for r in records if r[0] <= end_ms]
+
+    # 重复时间戳保留策略：first 保留每组最先出现的样本，last 保留最后出现
+    # 的样本；all 不去重。按源文件顺序扫描，字典键为解析后的 timestamp_ms。
+    if duplicate_policy != "all":
+        chosen: dict[int, tuple[int, int | float, int | float]] = {}
+        for record in records:
+            if duplicate_policy == "last" or record[0] not in chosen:
+                chosen[record[0]] = record
+        records = list(chosen.values())
 
     # 没有样本落入区间（或输入不含任何记录）：正常结束，标准输出为空。
     if not records:
@@ -380,6 +407,19 @@ def build_parser() -> argparse.ArgumentParser:
             "记录与上一条输出记录的 timestamp_ms 差值严格大于 MS 时为 "
             "true；首条输出记录固定为 false，差值恰好等于 MS 与重复"
             "时间戳均为 false。缺省则不输出该字段"
+        ),
+    )
+    parser.add_argument(
+        "--duplicate-policy",
+        choices=("all", "first", "last"),
+        default="all",
+        help=(
+            "重复时间戳保留策略：all（默认）保留全部重复记录；first 只保留"
+            "同一时间戳在源文件中最先出现的一条完整样本；last 只保留最后"
+            "出现的一条。重复依据解析后的 timestamp_ms 数值判断（如 CSV 中"
+            " 01500 与 1500 视为相同），记录不必相邻，温湿度不同也归入同组；"
+            "选中的温湿度来自同一原始记录，不平均或拼接。策略在闭区间筛选"
+            "之后应用"
         ),
     )
     return parser
@@ -469,11 +509,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.format == "jsonl":
             output = replay_jsonl_text(
-                text, start_ms, end_ms, gap_threshold_ms
+                text, start_ms, end_ms, gap_threshold_ms,
+                args.duplicate_policy,
             )
         else:
             output = replay_csv_text(
-                text, start_ms, end_ms, gap_threshold_ms
+                text, start_ms, end_ms, gap_threshold_ms,
+                args.duplicate_policy,
             )
     except InputError as exc:
         if exc.line is not None:
