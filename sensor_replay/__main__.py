@@ -96,6 +96,8 @@ def replay_csv_text(
     gap_threshold_ms 启用时为每条输出附加 missing_before 缺测标记。
     duplicate_policy 为 all/first/last 的重复时间戳保留策略。
     先校验全部记录（区间外的非法数据同样使输入失败），再按区间筛选。
+    读取阶段抛出的 csv.Error（如字段超过 csv.field_size_limit()）同样
+    归入 InputError，按记录序号定位（表头算第 1 条 CSV 记录）。
     """
     reader = csv.reader(io.StringIO(text, newline=""))
 
@@ -103,6 +105,9 @@ def replay_csv_text(
         header = next(reader)
     except StopIteration:
         raise InputError("文件为空，缺少表头", 1)
+    except csv.Error as exc:
+        # 表头即第 1 条 CSV 记录；字段超长等读取级错误归入输入错误。
+        raise InputError(f"CSV 解析失败: {exc}", 1) from exc
 
     if len(header) != len(REQUIRED_COLUMNS) or set(header) != set(
         REQUIRED_COLUMNS
@@ -118,17 +123,24 @@ def replay_csv_text(
     hum_idx = header.index("humidity")
 
     records: list[tuple[int, int | float, int | float]] = []
-    for record_no, row in enumerate(reader, start=2):
-        if len(row) != len(REQUIRED_COLUMNS):
-            raise InputError(
-                f"数据行列数不符：应为 {len(REQUIRED_COLUMNS)} 列，"
-                f"实际为 {len(row)} 列",
-                record_no,
-            )
-        timestamp_ms = parse_timestamp(row[ts_idx], record_no)
-        temperature = parse_number(row[temp_idx], "temperature", record_no)
-        humidity = parse_number(row[hum_idx], "humidity", record_no)
-        records.append((timestamp_ms, temperature, humidity))
+    record_no = 1
+    try:
+        for row in reader:
+            record_no += 1
+            if len(row) != len(REQUIRED_COLUMNS):
+                raise InputError(
+                    f"数据行列数不符：应为 {len(REQUIRED_COLUMNS)} 列，"
+                    f"实际为 {len(row)} 列",
+                    record_no,
+                )
+            timestamp_ms = parse_timestamp(row[ts_idx], record_no)
+            temperature = parse_number(row[temp_idx], "temperature", record_no)
+            humidity = parse_number(row[hum_idx], "humidity", record_no)
+            records.append((timestamp_ms, temperature, humidity))
+    except csv.Error as exc:
+        # 读取失败定位为下一条待读记录的序号：引号包裹的跨物理行字段
+        # 仍只算一条 CSV 记录。字段校验抛出的 InputError 不在此捕获。
+        raise InputError(f"CSV 解析失败: {exc}", record_no + 1) from exc
 
     return render_records(
         records, start_ms, end_ms, gap_threshold_ms, duplicate_policy
