@@ -4,7 +4,7 @@
 
 计划采用：Python 3 标准库 / csv / json / datetime / argparse。
 
-当前版本交付最小可运行功能：**CSV 温湿度样本的命令行即时回放**（仅依赖 Python 3 标准库，无需安装）。JSONL 导入、暂停续播、通道配置和统计导出留待后续版本。
+当前版本交付最小可运行功能：**CSV / JSONL 温湿度样本的命令行即时回放**（仅依赖 Python 3 标准库，无需安装）。用 `--format csv|jsonl` 选择输入格式，默认 `csv`，不按文件扩展名推断。暂停续播、通道配置和统计导出留待后续版本。
 
 ## 运行环境
 
@@ -14,13 +14,20 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <csv文件路径> [--start-ms MS] [--end-ms MS]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
 
   ```bash
   python -m sensor_replay "my data/demo.csv"
+  ```
+
+- `--format csv|jsonl`：选择样本格式，默认 `csv`，**不按文件扩展名推断**
+  （把 JSONL 内容存成 `.csv` 仍按 CSV 解析，反之亦然）。
+
+  ```bash
+  python -m sensor_replay demo.jsonl --format jsonl
   ```
 
 - `--start-ms MS` / `--end-ms MS`：可选的**时间区间回放**，只输出 `timestamp_ms`
@@ -36,13 +43,26 @@ python -m sensor_replay <csv文件路径> [--start-ms MS] [--end-ms MS]
 
 ## 输入文件格式
 
-- UTF-8 编码，**允许带 BOM**。
+两种格式均使用 UTF-8 编码，**允许文件开头带 BOM**。
+
+### CSV（`--format csv`，默认）
+
 - 首行为表头，必须恰好包含三列：`timestamp_ms`、`temperature`、`humidity`。
   - 列顺序可以任意；
   - 不接受额外列或重复列。
 - `timestamp_ms`：从某个起点开始的毫秒数，只接受**非负十进制整数**（不接受负号、小数、空白）。
 - `temperature`、`humidity`：有限数值，允许小数、负数和指数写法；不施加物理范围限制；`NaN`、`Infinity` 及溢出为无穷的值一律拒绝。
 - 数据行顺序任意，允许乱序和重复时间戳。
+
+### JSONL（`--format jsonl`）
+
+- 每个**非空物理行**恰好是一个 JSON 对象；**空白行被忽略但仍计入物理行号**；末行可以没有换行符。
+- 对象**仅含** `timestamp_ms`、`temperature`、`humidity` 三个键；缺键、多键或重复键均拒绝。
+- `timestamp_ms`：只接受**不带负号的 JSON 整数字面量**（如 `0`、`1000`）；拒绝负数（包括 `-0`）、小数（`1.0`）和指数（`1e3`）。
+- `temperature`、`humidity`：接受**有限 JSON 数值**，允许负数、小数和指数（`-3.5`、`1e2`），不施加物理范围限制；字符串、布尔值与 `null` 一律拒绝，`NaN`、`Infinity`、`-Infinity` 以及浮点溢出（如 `1e999`）一律拒绝。
+- 三个字段都拒绝字符串、布尔值与 `null`。
+- 行会被完整校验：语法错误、一行多个对象、非对象行（数组、标量）均拒绝。
+- 行顺序任意，允许乱序和重复时间戳。
 
 ## 回放与输出规则
 
@@ -85,6 +105,28 @@ python -m sensor_replay samples.csv
 
 即：按时间戳升序依次输出温度 19.5、20.5、21；`elapsed_ms` 依次为 0、1000、1000；湿度依次为 55、60、61；两条 `timestamp_ms = 1000` 的记录保持源文件先后顺序。
 
+仓库另自带 JSONL 样本 `demo.jsonl`（三行对象，乱序且含重复时间戳）：
+
+```jsonl
+{"timestamp_ms":2000,"temperature":22,"humidity":62}
+{"timestamp_ms":1000,"temperature":20.5,"humidity":60}
+{"timestamp_ms":1000,"temperature":21,"humidity":61}
+```
+
+在仓库根目录执行：
+
+```bash
+python -m sensor_replay demo.jsonl --format jsonl --start-ms 500 --end-ms 2000
+```
+
+预期标准输出（退出码 `0`，标准错误为空）：
+
+```json
+{"timestamp_ms":1000,"elapsed_ms":0,"temperature":20.5,"humidity":60}
+{"timestamp_ms":1000,"elapsed_ms":0,"temperature":21,"humidity":61}
+{"timestamp_ms":2000,"elapsed_ms":1000,"temperature":22,"humidity":62}
+```
+
 ## 错误处理与退出码
 
 以下情况均为输入错误：**标准输出保持为空**，错误信息写入**标准错误**，进程以退出码 **`2`** 结束，不输出堆栈：
@@ -94,13 +136,24 @@ python -m sensor_replay samples.csv
 - 数据行列数与表头不符；
 - `timestamp_ms` 非法（负数、小数、缺失、非数字等）；
 - `temperature` / `humidity` 缺失、无法解析，或为 `NaN`、无穷值；
+- JSONL 行不是合法 JSON、不是 JSON 对象、一行含多个对象；
+- JSONL 对象缺键、多键或存在重复键；
+- JSONL `timestamp_ms` 为负数（含 `-0`）、小数、指数，或类型为字符串、布尔值、`null`；
+- JSONL `temperature` / `humidity` 为字符串、布尔值、`null`、`NaN`、`Infinity`，或浮点溢出；
 - `--start-ms` / `--end-ms` 缺值或格式非法（符号、小数、指数、空白、空值），或起点大于终点；
+- `--format` 缺值或取值不在 `csv` / `jsonl` 中；
 - 文件不存在、是目录、无法读取，或不是有效 UTF-8 编码。
 
-数据记录错误会注明所在的 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条），例如：
+数据记录错误会注明位置：
+
+- CSV 模式注明 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条）；
+- JSONL 模式注明**从 1 开始的物理行号**，空白行也计数。
+
+例如：
 
 ```text
 错误: 第 3 条 CSV 记录: 数据行列数不符：应为 3 列，实际为 2 列
+错误: 第 4 行: temperature 必须是有限 JSON 数值，实际为 null: null
 ```
 
 文件类错误示例：
