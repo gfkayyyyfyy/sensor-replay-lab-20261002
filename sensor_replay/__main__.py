@@ -3,6 +3,7 @@
 读取 UTF-8（可带 BOM）的温湿度 CSV 样本，按 timestamp_ms 升序以演示时钟
 立即回放：第一条样本的回放时间为零，其余样本按时间戳差值推进。结果以
 JSON Lines 逐行写入标准输出；任何输入错误都只写入标准错误并以退出码 2 结束。
+可选参数 --start-ms/--end-ms 按时间区间（两端包含）筛选样本后再回放。
 """
 
 from __future__ import annotations
@@ -59,8 +60,17 @@ def parse_number(token: str, column: str, record: int) -> int | float:
     return value
 
 
-def replay_text(text: str) -> str:
-    """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。"""
+def replay_text(
+    text: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+) -> str:
+    """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。
+
+    start_ms/end_ms 为可选的 timestamp_ms 区间下界与上界（两端均包含），
+    None 表示该端不限制。先完整校验全部记录，再按区间筛选，因此区间外的
+    非法数据同样使整个输入失败。
+    """
     reader = csv.reader(io.StringIO(text, newline=""))
 
     try:
@@ -94,7 +104,13 @@ def replay_text(text: str) -> str:
         humidity = parse_number(row[hum_idx], "humidity", record_no)
         records.append((timestamp_ms, temperature, humidity))
 
-    # 只有合法表头而没有数据：正常结束，标准输出为空。
+    # 按时间区间筛选（两端包含）；省略的一端不限制。
+    if start_ms is not None:
+        records = [item for item in records if item[0] >= start_ms]
+    if end_ms is not None:
+        records = [item for item in records if item[0] <= end_ms]
+
+    # 没有数据（或没有样本落入区间）：正常结束，标准输出为空。
     if not records:
         return ""
 
@@ -115,6 +131,18 @@ def replay_text(text: str) -> str:
     return output.getvalue()
 
 
+def parse_bound(token: str) -> int:
+    """解析 --start-ms/--end-ms：仅 ASCII 数字组成的非负十进制整数。
+
+    允许前导零；不接受正负号、小数、指数、空白或空值。
+    """
+    if not _TIMESTAMP_RE.match(token):
+        raise argparse.ArgumentTypeError(
+            f"需为非负十进制整数（仅 ASCII 数字，允许前导零）: {token!r}"
+        )
+    return int(token)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sensor_replay",
@@ -127,11 +155,44 @@ def build_parser() -> argparse.ArgumentParser:
         "csv_path",
         help="温湿度样本 CSV 文件路径（UTF-8 编码，可带 BOM；路径可含空格）",
     )
+    parser.add_argument(
+        "--start-ms",
+        type=parse_bound,
+        default=None,
+        metavar="MS",
+        help=(
+            "只回放 timestamp_ms >= MS 的样本（下界，包含该端点）；"
+            "省略表示不限制下界"
+        ),
+    )
+    parser.add_argument(
+        "--end-ms",
+        type=parse_bound,
+        default=None,
+        metavar="MS",
+        help=(
+            "只回放 timestamp_ms <= MS 的样本（上界，包含该端点）；"
+            "省略表示不限制上界"
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+
+    if (
+        args.start_ms is not None
+        and args.end_ms is not None
+        and args.start_ms > args.end_ms
+    ):
+        print(
+            f"错误: 区间非法：--start-ms ({args.start_ms}) 大于 "
+            f"--end-ms ({args.end_ms})",
+            file=sys.stderr,
+        )
+        return EXIT_INPUT_ERROR
+
     path = Path(args.csv_path)
 
     try:
@@ -159,7 +220,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_INPUT_ERROR
 
     try:
-        output = replay_text(text)
+        output = replay_text(text, start_ms=args.start_ms, end_ms=args.end_ms)
     except InputError as exc:
         location = (
             f"第 {exc.record} 条 CSV 记录: " if exc.record is not None else ""
