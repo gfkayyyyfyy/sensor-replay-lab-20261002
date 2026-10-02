@@ -19,12 +19,13 @@ from pathlib import Path
 REQUIRED_COLUMNS = ("timestamp_ms", "temperature", "humidity")
 
 # timestamp_ms：仅非负十进制整数，不接受符号、空白、小数点或下划线。
-_TIMESTAMP_RE = re.compile(r"^[0-9]+$")
+# 注意用 \A/\Z 而非 ^/$：$ 会匹配末尾换行之前的位置，导致 "1000\n" 被误接受。
+_TIMESTAMP_RE = re.compile(r"\A[0-9]+\Z")
 # temperature/humidity：有限数值，允许小数和负数（不含 NaN/无穷/空白/下划线）。
 _NUMBER_RE = re.compile(
-    r"^-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$"
+    r"\A-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?\Z"
 )
-_INTEGER_FORM_RE = re.compile(r"^-?[0-9]+$")
+_INTEGER_FORM_RE = re.compile(r"\A-?[0-9]+\Z")
 
 EXIT_OK = 0
 EXIT_INPUT_ERROR = 2
