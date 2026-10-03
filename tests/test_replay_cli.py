@@ -1138,5 +1138,211 @@ class TestDuplicatePolicyJsonl(ReplayCliTestCase):
         self.assertIn("第 5 行", result.stderr)
 
 
+class TestSummaryCsv(ReplayCliTestCase):
+    """--summary 统计摘要（CSV）：单个 JSON 对象、六个字段。"""
+
+    SUMMARY_KEYS = {
+        "sample_count",
+        "first_ms",
+        "last_ms",
+        "duration_ms",
+        "temperature",
+        "humidity",
+    }
+
+    EMPTY_SUMMARY = {
+        "sample_count": 0,
+        "first_ms": None,
+        "last_ms": None,
+        "duration_ms": 0,
+        "temperature": {"min": None, "max": None},
+        "humidity": {"min": None, "max": None},
+    }
+
+    def assert_summary(
+        self, result: subprocess.CompletedProcess
+    ) -> dict:
+        """断言退出码 0、标准错误为空，输出恰为一个 JSON 对象加末尾换行。"""
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(result.stdout.endswith("\n"))
+        self.assertNotIn("\n", result.stdout[:-1])
+        summary = json.loads(result.stdout[:-1])
+        self.assertIsInstance(summary, dict)
+        self.assertEqual(set(summary.keys()), self.SUMMARY_KEYS)
+        return summary
+
+    def test_acceptance_duplicate_policy_first(self) -> None:
+        # 验收用例：1000,20,60 / 0,10,50 / 1000,30,70 + first。
+        path = self.write_csv(
+            [HEADER, "1000,20,60", "0,10,50", "1000,30,70"],
+            name="input.csv",
+        )
+        result = run_replay(path, "--summary", "--duplicate-policy", "first")
+        self.assertEqual(
+            self.assert_summary(result),
+            {
+                "sample_count": 2,
+                "first_ms": 0,
+                "last_ms": 1000,
+                "duration_ms": 1000,
+                "temperature": {"min": 10, "max": 20},
+                "humidity": {"min": 50, "max": 60},
+            },
+        )
+
+    def test_all_counts_duplicates_separately(self) -> None:
+        path = self.write_csv([HEADER, "1000,20,60", "0,10,50", "1000,30,70"])
+        summary = self.assert_summary(run_replay(path, "--summary"))
+        self.assertEqual(summary["sample_count"], 3)
+        self.assertEqual(summary["temperature"], {"min": 10, "max": 30})
+        self.assertEqual(summary["humidity"], {"min": 50, "max": 70})
+
+    def test_last_policy_uses_source_last_sample(self) -> None:
+        path = self.write_csv([HEADER, "1000,20,60", "0,10,50", "1000,30,70"])
+        summary = self.assert_summary(
+            run_replay(path, "--summary", "--duplicate-policy", "last")
+        )
+        self.assertEqual(summary["sample_count"], 2)
+        self.assertEqual(summary["temperature"], {"min": 10, "max": 30})
+        self.assertEqual(summary["humidity"], {"min": 50, "max": 70})
+
+    def test_interval_bounds_not_used_as_timestamps(self) -> None:
+        # first_ms/last_ms 取自最终记录，不以参数边界代替。
+        path = self.write_data_csv()
+        summary = self.assert_summary(
+            run_replay(
+                path, "--summary", "--start-ms", "500", "--end-ms", "2500"
+            )
+        )
+        self.assertEqual(summary["sample_count"], 3)
+        self.assertEqual(summary["first_ms"], 1000)
+        self.assertEqual(summary["last_ms"], 2000)
+        self.assertEqual(summary["duration_ms"], 1000)
+
+    def test_single_record_zero_span(self) -> None:
+        path = self.write_csv([HEADER, "5,-2.5,40"])
+        summary = self.assert_summary(run_replay(path, "--summary"))
+        self.assertEqual(summary["sample_count"], 1)
+        self.assertEqual(summary["first_ms"], 5)
+        self.assertEqual(summary["last_ms"], 5)
+        self.assertEqual(summary["duration_ms"], 0)
+        self.assertEqual(summary["temperature"], {"min": -2.5, "max": -2.5})
+        self.assertEqual(summary["humidity"], {"min": 40, "max": 40})
+
+    def test_empty_selection_still_outputs_summary(self) -> None:
+        path = self.write_data_csv()
+        result = run_replay(
+            path, "--summary", "--start-ms", "9000", "--end-ms", "9999"
+        )
+        self.assertEqual(self.assert_summary(result), self.EMPTY_SUMMARY)
+
+    def test_header_only_csv_outputs_empty_summary(self) -> None:
+        path = self.write_csv([HEADER])
+        self.assertEqual(
+            self.assert_summary(run_replay(path, "--summary")),
+            self.EMPTY_SUMMARY,
+        )
+
+    def test_empty_csv_still_errors(self) -> None:
+        path = self.write_csv([""])
+        result = run_replay(path, "--summary")
+        self.assert_input_error(result)
+        self.assertIn("第 1 条 CSV 记录", result.stderr)
+
+    def test_gap_threshold_combines_without_changing_summary(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        plain = self.assert_summary(run_replay(path, "--summary"))
+        with_gap = self.assert_summary(
+            run_replay(path, "--summary", GAP_FLAG, "1000")
+        )
+        self.assertEqual(plain, with_gap)
+        self.assertEqual(plain["sample_count"], 4)
+
+    def test_invalid_gap_threshold_still_rejected(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        result = run_replay(path, "--summary", GAP_FLAG, "0")
+        self.assert_input_error(result)
+        self.assertIn("--gap-threshold-ms", result.stderr)
+
+    def test_invalid_record_outside_interval_still_fails(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS, "9000,NaN,70"])
+        result = run_replay(
+            path, "--summary", "--start-ms", "500", "--end-ms", "4000"
+        )
+        self.assert_input_error(result)
+        self.assertIn("第 6 条 CSV 记录", result.stderr)
+
+    def test_summary_with_value_rejected(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        for extra in (["--summary=1"], ["--summary=all"], ["--summary="]):
+            result = run_replay(path, *extra)
+            self.assert_input_error(result)
+            self.assertIn("--summary", result.stderr)
+
+    def test_omitted_summary_keeps_replay_output(self) -> None:
+        path = self.write_csv([HEADER, *GAP_ROWS])
+        records = self.assert_success(run_replay(path))
+        self.assertEqual(
+            [r["timestamp_ms"] for r in records], [500, 1500, 1500, 4000]
+        )
+
+
+class TestSummaryJsonl(ReplayCliTestCase):
+    """--summary 在 JSONL 下与 CSV 结果一致。"""
+
+    def test_acceptance_matches_csv(self) -> None:
+        path = self.write_jsonl_objects(
+            [
+                {"timestamp_ms": 1000, "temperature": 20, "humidity": 60},
+                {"timestamp_ms": 0, "temperature": 10, "humidity": 50},
+                {"timestamp_ms": 1000, "temperature": 30, "humidity": 70},
+            ]
+        )
+        result = self.run_jsonl(path, "--summary", "--duplicate-policy", "first")
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "sample_count": 2,
+                "first_ms": 0,
+                "last_ms": 1000,
+                "duration_ms": 1000,
+                "temperature": {"min": 10, "max": 20},
+                "humidity": {"min": 50, "max": 60},
+            },
+        )
+
+    def test_empty_and_blank_only_files_output_empty_summary(self) -> None:
+        for lines in ([], ["", "  ", "\t"]):
+            path = self.write_jsonl(lines)
+            result = self.run_jsonl(path, "--summary")
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertEqual(result.stderr, "")
+            self.assertEqual(
+                json.loads(result.stdout),
+                {
+                    "sample_count": 0,
+                    "first_ms": None,
+                    "last_ms": None,
+                    "duration_ms": 0,
+                    "temperature": {"min": None, "max": None},
+                    "humidity": {"min": None, "max": None},
+                },
+            )
+
+    def test_invalid_record_outside_interval_still_fails(self) -> None:
+        path = self.write_jsonl(
+            [
+                '{"timestamp_ms":1000,"temperature":20,"humidity":60}',
+                '{"timestamp_ms":9000,"temperature":"x","humidity":1}',
+            ]
+        )
+        result = self.run_jsonl(path, "--summary", "--end-ms", "2000")
+        self.assert_input_error(result)
+        self.assertIn("第 2 行", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

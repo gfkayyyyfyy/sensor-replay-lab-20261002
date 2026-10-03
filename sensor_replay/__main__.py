@@ -16,6 +16,12 @@
 多条样本的保留策略：all 保留全部；first/last 分别只保留该时间戳在源文件中
 最先、最后出现的一条完整样本。重复依据为解析后的 timestamp_ms 数值（CSV 中
 01500 与 1500 同组），策略在整文件校验并完成区间筛选后生效。
+
+可选的无值开关 ``--summary`` 输出统计摘要而非逐条回放：标准输出只含一个
+JSON 对象和末尾换行，字段为 sample_count、first_ms、last_ms、duration_ms、
+temperature、humidity（后两者各为仅含 min、max 的对象）。统计基于整文件
+校验后经闭区间筛选和重复策略确定的最终记录；无选中记录时数量与跨度为 0，
+两端时间戳及各通道极值为 null。
 """
 
 from __future__ import annotations
@@ -89,12 +95,14 @@ def replay_csv_text(
     end_ms: int | None = None,
     gap_threshold_ms: int | None = None,
     duplicate_policy: str = "all",
+    summary: bool = False,
 ) -> str:
     """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。
 
     start_ms/end_ms 为可选的 timestamp_ms 闭区间端点；省略的一端不限制。
     gap_threshold_ms 启用时为每条输出附加 missing_before 缺测标记。
     duplicate_policy 为 all/first/last 的重复时间戳保留策略。
+    summary 为 True 时改为输出单个 JSON 摘要对象（末尾一个换行）。
     先校验全部记录（区间外的非法数据同样使输入失败），再按区间筛选。
     """
     reader = csv.reader(io.StringIO(text, newline=""))
@@ -147,8 +155,8 @@ def replay_csv_text(
         records.append((timestamp_ms, temperature, humidity))
         record_no += 1
 
-    return render_records(
-        records, start_ms, end_ms, gap_threshold_ms, duplicate_policy
+    return render_output(
+        records, start_ms, end_ms, gap_threshold_ms, duplicate_policy, summary
     )
 
 
@@ -291,12 +299,14 @@ def replay_jsonl_text(
     end_ms: int | None = None,
     gap_threshold_ms: int | None = None,
     duplicate_policy: str = "all",
+    summary: bool = False,
 ) -> str:
     """解析 JSON Lines 文本并返回 JSON Lines 输出字符串。
 
     先逐行校验整个文件（区间外的非法记录同样使整次回放失败），再按时间
     区间筛选。物理行号从 1 开始且空白行也计数；忽略仅含空白的行；末行
-    可以没有换行符。空文件或仅含空白行时正常返回空字符串。
+    可以没有换行符。空文件或仅含空白行时正常返回空字符串（summary 模式
+    下返回空摘要对象）。
     """
     records: list[tuple[int, int | float, int | float]] = []
     for line_no, line in enumerate(text.splitlines(), start=1):
@@ -304,9 +314,117 @@ def replay_jsonl_text(
             continue
         records.append(parse_jsonl_line(line, line_no))
 
+    return render_output(
+        records, start_ms, end_ms, gap_threshold_ms, duplicate_policy, summary
+    )
+
+
+def render_output(
+    records: list[tuple[int, int | float, int | float]],
+    start_ms: int | None,
+    end_ms: int | None,
+    gap_threshold_ms: int | None = None,
+    duplicate_policy: str = "all",
+    summary: bool = False,
+) -> str:
+    """按 summary 开关选择逐条回放输出或单个统计摘要对象。"""
+    if summary:
+        return render_summary(records, start_ms, end_ms, duplicate_policy)
     return render_records(
         records, start_ms, end_ms, gap_threshold_ms, duplicate_policy
     )
+
+
+def select_records(
+    records: list[tuple[int, int | float, int | float]],
+    start_ms: int | None,
+    end_ms: int | None,
+    duplicate_policy: str = "all",
+) -> list[tuple[int, int | float, int | float]]:
+    """闭区间筛选、稳定排序并按 duplicate_policy 去重，返回最终记录列表。
+
+    顺序固定为：闭区间筛选（两端包含，只选原始样本，不插值）→ 按
+    timestamp_ms 稳定排序（重复时间戳保持源文件先后）→ 按
+    duplicate_policy 去重（all 保留全部；first/last 分别只保留同一
+    时间戳在源文件中最先/最后出现的一条完整样本，重复依据为解析后的
+    timestamp_ms 数值，且记录不必相邻）。
+    """
+    if start_ms is not None:
+        records = [r for r in records if r[0] >= start_ms]
+    if end_ms is not None:
+        records = [r for r in records if r[0] <= end_ms]
+
+    # 稳定排序：时间戳升序；重复时间戳保留源文件中的先后顺序。
+    records = sorted(records, key=lambda item: item[0])
+
+    if duplicate_policy != "all":
+        # 排序后同一时间戳必然相邻；first 保留每组首条，last 保留末条，
+        # 选中的温湿度始终来自同一条原始记录，不平均也不拼接。
+        deduped: list[tuple[int, int | float, int | float]] = []
+        index = 0
+        while index < len(records):
+            next_index = index + 1
+            while (
+                next_index < len(records)
+                and records[next_index][0] == records[index][0]
+            ):
+                next_index += 1
+            if duplicate_policy == "first":
+                deduped.append(records[index])
+            else:  # "last"
+                deduped.append(records[next_index - 1])
+            index = next_index
+        records = deduped
+
+    return records
+
+
+def render_summary(
+    records: list[tuple[int, int | float, int | float]],
+    start_ms: int | None,
+    end_ms: int | None,
+    duplicate_policy: str = "all",
+) -> str:
+    """对最终记录输出单个 JSON 统计摘要对象（末尾一个换行）。
+
+    统计基于整文件校验后经闭区间筛选和重复策略确定的最终记录：
+    sample_count 为最终记录计数（all 下重复点分别计数）；first_ms、
+    last_ms 为最终记录最早、最晚时间戳，duration_ms 为两者之差（不以
+    参数边界代替）；temperature、humidity 各为仅含 min、max 的对象，
+    取各通道真实样本极值，不插值或平均。无选中记录时数量与跨度为 0，
+    两端时间戳及各通道极值为 null。
+    """
+    selected = select_records(records, start_ms, end_ms, duplicate_policy)
+    if not selected:
+        summary: dict[str, object] = {
+            "sample_count": 0,
+            "first_ms": None,
+            "last_ms": None,
+            "duration_ms": 0,
+            "temperature": {"min": None, "max": None},
+            "humidity": {"min": None, "max": None},
+        }
+    else:
+        # select_records 已按时间戳升序排列，首末即最早、最晚时间戳。
+        first_ms = selected[0][0]
+        last_ms = selected[-1][0]
+        temperatures = [r[1] for r in selected]
+        humidities = [r[2] for r in selected]
+        summary = {
+            "sample_count": len(selected),
+            "first_ms": first_ms,
+            "last_ms": last_ms,
+            "duration_ms": last_ms - first_ms,
+            "temperature": {
+                "min": min(temperatures),
+                "max": max(temperatures),
+            },
+            "humidity": {
+                "min": min(humidities),
+                "max": max(humidities),
+            },
+        }
+    return json.dumps(summary, separators=(",", ":")) + "\n"
 
 
 def render_records(
@@ -328,37 +446,11 @@ def render_records(
     差值严格大于阈值时为 true；首条记录固定为 false，差值恰好等于阈值与
     重复时间戳均为 false。区间外的样本和区间端点不参与判定。
     """
-    # 按时间区间筛选（闭区间，两端包含）；只选原始样本，不插值。
-    if start_ms is not None:
-        records = [r for r in records if r[0] >= start_ms]
-    if end_ms is not None:
-        records = [r for r in records if r[0] <= end_ms]
+    records = select_records(records, start_ms, end_ms, duplicate_policy)
 
     # 没有样本落入区间（或输入不含任何记录）：正常结束，标准输出为空。
     if not records:
         return ""
-
-    # 稳定排序：时间戳升序；重复时间戳保留源文件中的先后顺序。
-    records.sort(key=lambda item: item[0])
-
-    if duplicate_policy != "all":
-        # 排序后同一时间戳必然相邻；first 保留每组首条，last 保留末条，
-        # 选中的温湿度始终来自同一条原始记录，不平均也不拼接。
-        deduped: list[tuple[int, int | float, int | float]] = []
-        index = 0
-        while index < len(records):
-            next_index = index + 1
-            while (
-                next_index < len(records)
-                and records[next_index][0] == records[index][0]
-            ):
-                next_index += 1
-            if duplicate_policy == "first":
-                deduped.append(records[index])
-            else:  # "last"
-                deduped.append(records[next_index - 1])
-            index = next_index
-        records = deduped
 
     first_timestamp = records[0][0]
 
@@ -449,6 +541,21 @@ def build_parser() -> argparse.ArgumentParser:
             "拼接）。重复依据为解析后的 timestamp_ms 数值（如 CSV 中 "
             "01500 与 1500 视为相同时间戳），策略在整文件校验并完成区间"
             "筛选后生效"
+        ),
+    )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help=(
+            "可选统计摘要开关（无值，--summary=任意值 均为输入错误）：启用后"
+            "不再逐条回放，标准输出只含一个 JSON 对象和末尾换行，字段为 "
+            "sample_count、first_ms、last_ms、duration_ms、temperature、"
+            "humidity（后两者各为仅含 min、max 的对象）。统计基于整文件校验"
+            "后经闭区间筛选和重复策略确定的最终记录：sample_count 为最终记录"
+            "计数（all 下重复点分别计数）；first_ms、last_ms 为最终记录最早、"
+            "最晚时间戳，duration_ms 为两者之差；temperature、humidity 取各"
+            "通道真实样本极值，不插值或平均。无选中记录时数量与跨度为 0，"
+            "两端时间戳及各通道极值为 null。缺省则保持原有逐条回放输出"
         ),
     )
     return parser
@@ -543,6 +650,7 @@ def main(argv: list[str] | None = None) -> int:
                 end_ms,
                 gap_threshold_ms,
                 args.duplicate_policy,
+                summary=args.summary,
             )
         else:
             output = replay_csv_text(
@@ -551,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
                 end_ms,
                 gap_threshold_ms,
                 args.duplicate_policy,
+                summary=args.summary,
             )
     except InputError as exc:
         if exc.line is not None:

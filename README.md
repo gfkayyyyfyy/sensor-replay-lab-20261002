@@ -14,7 +14,7 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last] [--summary]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
@@ -59,6 +59,26 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
     首条固定为 `false`，差值严格大于阈值才为 `true`；
   - 缺值、空字符串或 `all`/`first`/`last` 之外的取值均为输入错误（退出码
     `2`，标准输出为空，错误信息点名 `--duplicate-policy`，无堆栈）。
+- `--summary`：可选的**统计摘要开关**（无值；`--summary=任意值` 均为输入
+  错误，退出码 `2`，错误信息点名 `--summary`）。启用后不再逐条回放，标准
+  输出只含**一个 JSON 对象和末尾换行**，退出码 `0` 时标准错误为空。摘要
+  恰好包含六个字段（键顺序不限）：
+  - `sample_count`：整文件校验后，经闭区间筛选和重复策略确定的**最终记录
+    计数**（`all` 下重复点分别计数，`first`/`last` 沿用源文件取完整样本
+    的规则）；
+  - `first_ms` / `last_ms`：最终记录最早、最晚的 `timestamp_ms`；
+  - `duration_ms`：两者之差（不以参数边界代替；单条记录时跨度为 `0`）；
+  - `temperature` / `humidity`：各为仅含 `min`、`max` 的对象，取各通道
+    **真实样本极值**，不插值或平均（单条记录时两个极值相同）。
+  - 合法输入无选中记录时仍输出摘要：数量与跨度为 `0`，两端时间戳及各
+    通道极值为 `null`（CSV 只有合法表头、JSONL 为空或仅含空白行也如此；
+    空 CSV 仍报错）；
+  - 可与 `--gap-threshold-ms` 同时使用：阈值照常校验，合法取值不改变
+    摘要字段和值；
+  - 文件、参数或样本非法时统一退出码 `2`，标准输出为空，标准错误保留
+    既有字段提示和行或记录定位，无堆栈；区间外或被策略舍弃的非法记录
+    同样不能产生摘要；
+  - 省略该开关时保持现有回放输出、缺测标记和演示时钟行为。
 - 查看帮助：
 
   ```bash
@@ -208,6 +228,20 @@ python -m sensor_replay demo.csv --duplicate-policy last --start-ms 1500 --end-m
 `elapsed_ms` 始终从最终首条输出的时间戳计起；等价 JSONL 输入显式选择
 `--format jsonl` 时结果一致。
 
+统计摘要示例（`--summary` 输出单个 JSON 对象而非逐条回放）：
+
+```bash
+python -m sensor_replay demo.csv --summary --duplicate-policy first
+```
+
+```json
+{"sample_count":3,"first_ms":500,"last_ms":4000,"duration_ms":3500,"temperature":{"min":20,"max":23},"humidity":{"min":55,"max":58}}
+```
+
+`sample_count` 为区间筛选和重复策略后的最终记录计数；`first_ms`/`last_ms`
+取自最终记录的最早、最晚时间戳；`temperature`/`humidity` 为各通道真实样本
+极值。等价 JSONL 输入显式选择 `--format jsonl` 时结果一致。
+
 ## 错误处理与退出码
 
 以下情况均为输入错误：**标准输出保持为空**，错误信息写入**标准错误**，进程以退出码 **`2`** 结束，不输出堆栈：
@@ -233,6 +267,7 @@ python -m sensor_replay demo.csv --duplicate-policy last --start-ms 1500 --end-m
     `--gap-threshold-ms`；
   - `--duplicate-policy` 缺值、空字符串或取值不在 `all`/`first`/`last` 中；
     错误信息会点名 `--duplicate-policy`；
+  - `--summary` 以 `--summary=任意值` 形式带值；错误信息会点名 `--summary`；
   - 文件不存在、是目录、无法读取，或不是有效 UTF-8 编码。
 
 CSV 数据错误会注明所在的 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条）；JSONL 错误会注明从 1 开始的**物理行号**（空白行也计数），例如：
