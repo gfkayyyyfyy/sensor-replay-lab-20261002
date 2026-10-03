@@ -299,6 +299,25 @@ def parse_jsonl_line(
     return timestamp_ms, temperature, humidity
 
 
+# 物理行切分只认 LF、CRLF 与单独 CR（CRLF 只计一次换行）。不能用
+# str.splitlines()：它还把 U+000B、U+0085、U+2028 等 Unicode 行边界当作
+# 换行，会把同一物理行拆成多条样本；这些字符应作为所在行的内容参与校验。
+_PHYSICAL_LINE_RE = re.compile(r"\r\n|\r|\n")
+
+
+def split_physical_lines(text: str) -> list[str]:
+    """按 LF / CRLF / 单独 CR 切分物理行，与 splitlines 一样不产生末尾空行。
+
+    其他 Unicode 行分隔符（U+000B、U+0085、U+2028 等）不视为换行，
+    原样保留在所在行内容中。
+    """
+    lines = _PHYSICAL_LINE_RE.split(text)
+    # 末尾的换行符不额外产生一个空行（与 str.splitlines 行为一致）。
+    if lines and lines[-1] == "" and text.endswith(("\n", "\r")):
+        lines.pop()
+    return lines
+
+
 def replay_jsonl_text(
     text: str,
     start_ms: int | None = None,
@@ -311,12 +330,14 @@ def replay_jsonl_text(
 
     先逐行校验整个文件（区间外的非法记录同样使整次回放失败），再按时间
     区间筛选。物理行号从 1 开始且空白行也计数；忽略仅含空白的行；末行
-    可以没有换行符。空文件或仅含空白行时正常返回空字符串；summary 为真
+    可以没有换行符。物理行只按 LF、CRLF 与单独 CR 切分（CRLF 计一次）；
+    U+000B、U+0085、U+2028 等其他 Unicode 行边界不视为换行，作为所在行
+    的内容参与校验。空文件或仅含空白行时正常返回空字符串；summary 为真
     时改为返回唯一的统计摘要 JSON 对象（末尾带换行），无记录时摘要中
     数量与跨度为 0、其余字段为 null。
     """
     records: list[tuple[int, int | float, int | float]] = []
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    for line_no, line in enumerate(split_physical_lines(text), start=1):
         if not line.strip():  # 空白行计数但不参与解析
             continue
         records.append(parse_jsonl_line(line, line_no))
