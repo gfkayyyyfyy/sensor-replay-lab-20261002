@@ -14,7 +14,7 @@
 ## 公开命令
 
 ```bash
-python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last]
+python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--end-ms MS] [--gap-threshold-ms MS] [--duplicate-policy all|first|last] [--summary]
 ```
 
 - 文件路径是唯一必填参数，**支持带空格的路径**（用引号包裹即可）：
@@ -59,6 +59,25 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
     首条固定为 `false`，差值严格大于阈值才为 `true`；
   - 缺值、空字符串或 `all`/`first`/`last` 之外的取值均为输入错误（退出码
     `2`，标准输出为空，错误信息点名 `--duplicate-policy`，无堆栈）。
+- `--summary`：可选的**无值统计摘要开关**。启用后不进行回放，标准输出
+  **只含唯一一个 JSON 对象和末尾换行**，成功退出码为 `0` 且标准错误为空；
+  省略时保持现有 JSON Lines 回放输出、缺测标记和演示时钟行为不变。摘要恰好
+  含以下六个字段（键顺序任意）：
+  - `sample_count`：按整文件校验后，经闭区间筛选和重复点策略确定的**最终
+    记录计数**；`all` 下重复点分别计数，`first`/`last` 沿用源文件取完整
+    样本的规则；
+  - `first_ms` / `last_ms`：最终记录最早、最晚的 `timestamp_ms`；
+  - `duration_ms` = `last_ms - first_ms`（单条记录跨度为 0；**不以参数
+    边界代替**）；
+  - `temperature` / `humidity`：各为**仅含 `min`、`max`** 的对象，取各通道
+    最终记录的真实样本极值，不插值、不平均；单条记录时两个极值相同；
+  - 合法输入**无选中记录**时仍输出摘要：`sample_count` 与 `duration_ms`
+    为 `0`，`first_ms`、`last_ms` 及各通道极值为 `null`；CSV 只有合法表头、
+    JSONL 为空或仅含空白行同样如此（**空 CSV 仍报错**）；
+  - 可与 `--gap-threshold-ms` 同时使用：阈值继续按既有规则校验，合法取值
+    不改变摘要字段和值；
+  - 摘要仅基于最终记录，不包含其他字段；`--summary=任意值` 一律拒绝（退出码
+    `2`，错误信息点名 `--summary`，无堆栈）。
 - 查看帮助：
 
   ```bash
@@ -112,6 +131,33 @@ python -m sensor_replay <文件路径> [--format csv|jsonl] [--start-ms MS] [--e
 
 - 忠实保留每条样本的温湿度数值，不插值、不平均；缺测标记同样不增减记录。
 - 正常结束退出码为 `0`。
+
+### 统计摘要（`--summary`）
+
+启用 `--summary` 时不回放记录，标准输出为**唯一一个 JSON 对象加末尾换行**
+（不是 JSON Lines，没有逐行输出），退出码 `0`、标准错误为空。摘要恰好含
+`sample_count`、`first_ms`、`last_ms`、`duration_ms`、`temperature`、
+`humidity` 六个字段，其中 `temperature`/`humidity` 各自只含 `min`/`max`：
+
+```bash
+python -m sensor_replay samples.csv --summary
+```
+
+```json
+{"sample_count":3,"first_ms":0,"last_ms":1000,"duration_ms":1000,"temperature":{"min":19.5,"max":21},"humidity":{"min":55,"max":61}}
+```
+
+计数与极值均基于**整文件校验后**再经闭区间筛选与重复点策略确定的最终记录；
+`all`（默认）下重复点分别计数。使用 `first`/`last` 时极值取自策略保留下来的
+完整样本，不平均、不拼接。无选中记录时输出：
+
+```json
+{"sample_count":0,"first_ms":null,"last_ms":null,"duration_ms":0,"temperature":{"min":null,"max":null},"humidity":{"min":null,"max":null}}
+```
+
+`--gap-threshold-ms` 可与 `--summary` 同时使用，但缺测标记不进入摘要；阈值
+取值仍按既有规则校验。区间、重复策略、格式选择（`--format jsonl`）与文件
+编码约定均与回放模式完全一致；等价 JSONL 显式指定格式后摘要结果相同。
 
 ## 本地演示
 
@@ -233,6 +279,8 @@ python -m sensor_replay demo.csv --duplicate-policy last --start-ms 1500 --end-m
     `--gap-threshold-ms`；
   - `--duplicate-policy` 缺值、空字符串或取值不在 `all`/`first`/`last` 中；
     错误信息会点名 `--duplicate-policy`；
+  - `--summary` 带任何取值（如 `--summary=true`、`--summary=`）；错误信息
+    会点名 `--summary`；
   - 文件不存在、是目录、无法读取，或不是有效 UTF-8 编码。
 
 CSV 数据错误会注明所在的 **CSV 记录序号**（表头算第 1 条，其后的数据行依次为第 2、3……条）；JSONL 错误会注明从 1 开始的**物理行号**（空白行也计数），例如：
@@ -249,4 +297,4 @@ CSV 数据错误会注明所在的 **CSV 记录序号**（表头算第 1 条，�
 错误: 文件 samples.csv 不是有效的 UTF-8 编码
 ```
 
-特例：CSV 文件**只有合法表头而没有数据行**，以及 JSONL 文件为空或**仅含空白行**时，均视为正常输入，退出码 `0` 且标准输出为空。
+特例：CSV 文件**只有合法表头而没有数据行**，以及 JSONL 文件为空或**仅含空白行**时，均视为正常输入，退出码 `0` 且标准输出为空；使用 `--summary` 时标准输出改为无选中记录的摘要 JSON（数量与跨度为 `0`，其余为 `null`）。空 CSV（连表头都没有）仍按输入错误处理，即使指定 `--summary` 也不产生摘要。
