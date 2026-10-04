@@ -458,6 +458,25 @@ def sample_min_interval(
     return kept
 
 
+def final_records(
+    records: list[tuple[int, int | float, int | float]],
+    start_ms: int | None,
+    end_ms: int | None,
+    duplicate_policy: str = "all",
+    min_interval_ms: int | None = None,
+) -> list[tuple[int, int | float, int | float]]:
+    """确定回放与摘要共用的最终记录，两种输出只此一处维护。
+
+    顺序固定为：闭区间筛选 → 按 timestamp_ms 稳定排序 → 重复策略 →
+    最小间隔抽样。前两步与去重见 :func:`select_records`，抽样见
+    :func:`sample_min_interval`；本函数只做编排，回放（含
+    elapsed_ms/missing_before 的重算依据）与统计摘要（计数、跨度、极值）
+    必须基于本函数返回的同一批最终记录。
+    """
+    records = select_records(records, start_ms, end_ms, duplicate_policy)
+    return sample_min_interval(records, min_interval_ms)
+
+
 def render_records(
     records: list[tuple[int, int | float, int | float]],
     start_ms: int | None,
@@ -466,17 +485,18 @@ def render_records(
     duplicate_policy: str = "all",
     min_interval_ms: int | None = None,
 ) -> str:
-    """区间筛选、稳定排序、去重、抽样并序列化为 JSON Lines；无命中返回空串。
+    """将最终记录序列化为 JSON Lines；无命中返回空串。
 
-    先按闭区间筛选与重复点策略确定记录，再按 min_interval_ms 做最小间隔
-    抽样。gap_threshold_ms 非 None 时为每条输出附加布尔字段
-    missing_before：依据**抽样后**的相邻输出记录，当前记录与上一条输出
-    记录的 timestamp_ms 差值严格大于阈值时为 true；首条记录固定为
-    false，差值恰好等于阈值与重复时间戳均为 false。elapsed_ms 从抽样后
-    的首条记录计起。
+    最终记录由回放与摘要共用的 :func:`final_records` 统一确定（闭区间
+    筛选、稳定排序、重复策略、最小间隔抽样）。gap_threshold_ms 非 None
+    时为每条输出附加布尔字段 missing_before：依据最终相邻记录，当前记录
+    与上一条输出记录的 timestamp_ms 差值严格大于阈值时为 true；首条记录
+    固定为 false，差值恰好等于阈值与重复时间戳均为 false。elapsed_ms
+    从最终首条记录计起。
     """
-    records = select_records(records, start_ms, end_ms, duplicate_policy)
-    records = sample_min_interval(records, min_interval_ms)
+    records = final_records(
+        records, start_ms, end_ms, duplicate_policy, min_interval_ms
+    )
 
     # 没有样本落入区间（或输入不含任何记录）：正常结束，标准输出为空。
     if not records:
@@ -513,16 +533,19 @@ def build_summary(
     duplicate_policy: str = "all",
     min_interval_ms: int | None = None,
 ) -> dict[str, object]:
-    """对区间筛选、去重与最小间隔抽样后的最终记录计算统计摘要。
+    """对最终记录计算统计摘要。
 
-    sample_count 为最终记录计数（all 下重复点分别计数，first/last 沿用
-    源文件取完整样本的规则）；first_ms/last_ms 为最终记录最早、最晚时间
-    戳；duration_ms 为两者之差（不取参数边界）；temperature/humidity 各
-    为只含 min/max 的对象，取最终记录的真实样本极值，不插值、不平均。
+    最终记录与回放共用 :func:`final_records`（闭区间筛选、稳定排序、重复
+    策略与最小间隔抽样只维护一处）。sample_count 为最终记录计数（all 下
+    重复点分别计数，first/last 沿用源文件取完整样本的规则）；
+    first_ms/last_ms 为最终记录最早、最晚时间戳；duration_ms 为两者之差
+    （不取参数边界）；temperature/humidity 各为只含 min/max 的对象，取
+    最终记录的真实样本极值，不插值、不平均。
     无选中记录时数量与跨度为 0，时间戳与各通道 min/max 均为 null。
     """
-    records = select_records(records, start_ms, end_ms, duplicate_policy)
-    records = sample_min_interval(records, min_interval_ms)
+    records = final_records(
+        records, start_ms, end_ms, duplicate_policy, min_interval_ms
+    )
     if not records:
         return {
             "sample_count": 0,
