@@ -17,6 +17,14 @@
 最先、最后出现的一条完整样本。重复依据为解析后的 timestamp_ms 数值（CSV 中
 01500 与 1500 同组），策略在整文件校验并完成区间筛选后生效。
 
+可选的 ``--min-interval-ms MS`` 启用最小时间间隔抽样：在闭区间筛选、稳定
+排序与重复点策略确定的记录上，按时间升序保留时间戳组——最早的时间戳组始终
+保留，其后仅当某组与上一个**保留**组的时间戳差值至少为 MS（恰好相等也保留）
+时才整体保留该组；被跳过的组不改变比较基准，末组不足间隔时不强行保留。抽样
+只选择既有完整记录，不生成时间戳、不插值、不平均，保留记录的温湿度不变；
+elapsed_ms 从抽样后的首条记录重新计起，missing_before 比较抽样后的相邻输出
+记录。省略时保持全部既有行为。
+
 可选的无值开关 ``--summary`` 不回放，而是向标准输出写入唯一一个统计摘要
 JSON 对象（末尾带换行）：sample_count 为区间筛选与重复点策略后的最终记录
 计数；first_ms/last_ms 为最终记录的最早、最晚时间戳；duration_ms 为两者
@@ -97,6 +105,7 @@ def replay_csv_text(
     gap_threshold_ms: int | None = None,
     duplicate_policy: str = "all",
     summary: bool = False,
+    min_interval_ms: int | None = None,
 ) -> str:
     """解析 CSV 文本并返回 JSON Lines 输出字符串；非法时抛出 InputError。
 
@@ -105,6 +114,7 @@ def replay_csv_text(
     模式不输出记录，该参数仅继续被校验而不影响摘要字段）。
     duplicate_policy 为 all/first/last 的重复时间戳保留策略。
     summary 为真时改为返回唯一的统计摘要 JSON 对象（末尾带换行）。
+    min_interval_ms 启用时在区间筛选与重复点策略之后做最小间隔抽样。
     先校验全部记录（区间外的非法数据同样使输入失败），再按区间筛选。
     """
     reader = csv.reader(io.StringIO(text, newline=""))
@@ -159,10 +169,15 @@ def replay_csv_text(
 
     if summary:
         return render_summary(
-            records, start_ms, end_ms, duplicate_policy
+            records, start_ms, end_ms, duplicate_policy, min_interval_ms
         )
     return render_records(
-        records, start_ms, end_ms, gap_threshold_ms, duplicate_policy
+        records,
+        start_ms,
+        end_ms,
+        gap_threshold_ms,
+        duplicate_policy,
+        min_interval_ms,
     )
 
 
@@ -325,6 +340,7 @@ def replay_jsonl_text(
     gap_threshold_ms: int | None = None,
     duplicate_policy: str = "all",
     summary: bool = False,
+    min_interval_ms: int | None = None,
 ) -> str:
     """解析 JSON Lines 文本并返回 JSON Lines 输出字符串。
 
@@ -334,7 +350,8 @@ def replay_jsonl_text(
     U+000B、U+0085、U+2028 等其他 Unicode 行边界不视为换行，作为所在行
     的内容参与校验。空文件或仅含空白行时正常返回空字符串；summary 为真
     时改为返回唯一的统计摘要 JSON 对象（末尾带换行），无记录时摘要中
-    数量与跨度为 0、其余字段为 null。
+    数量与跨度为 0、其余字段为 null。min_interval_ms 启用时在区间筛选与
+    重复点策略之后做最小间隔抽样。
     """
     records: list[tuple[int, int | float, int | float]] = []
     for line_no, line in enumerate(split_physical_lines(text), start=1):
@@ -344,10 +361,15 @@ def replay_jsonl_text(
 
     if summary:
         return render_summary(
-            records, start_ms, end_ms, duplicate_policy
+            records, start_ms, end_ms, duplicate_policy, min_interval_ms
         )
     return render_records(
-        records, start_ms, end_ms, gap_threshold_ms, duplicate_policy
+        records,
+        start_ms,
+        end_ms,
+        gap_threshold_ms,
+        duplicate_policy,
+        min_interval_ms,
     )
 
 
@@ -398,21 +420,63 @@ def select_records(
     return records
 
 
+def sample_min_interval(
+    records: list[tuple[int, int | float, int | float]],
+    min_interval_ms: int | None,
+) -> list[tuple[int, int | float, int | float]]:
+    """在已区间筛选、稳定排序并去重的记录上做最小时间间隔抽样。
+
+    按时间升序遍历时间戳组（排序后同一时间戳的记录必然相邻，all 下一个
+    组可含多条）：最早的组始终保留；其后仅当某组与上一个**保留**组的
+    timestamp_ms 差值至少为 min_interval_ms（恰好相等也保留）时才整体
+    保留该组。被跳过的组不改变比较基准；末组不足间隔时不强行保留。
+    抽样只选择既有完整记录，不生成时间戳、不插值、不平均。
+    min_interval_ms 为 None 时原样返回，保持全部既有行为。
+    """
+    if min_interval_ms is None or not records:
+        return records
+
+    kept: list[tuple[int, int | float, int | float]] = []
+    index = 0
+    total = len(records)
+    while index < total:
+        group_timestamp = records[index][0]
+        next_index = index + 1
+        while (
+            next_index < total
+            and records[next_index][0] == group_timestamp
+        ):
+            next_index += 1
+
+        if (
+            not kept
+            or group_timestamp - kept[-1][0] >= min_interval_ms
+        ):
+            # 整组保留：all 维持组内源顺序，first/last 组内本就只有一条。
+            kept.extend(records[index:next_index])
+        index = next_index
+    return kept
+
+
 def render_records(
     records: list[tuple[int, int | float, int | float]],
     start_ms: int | None,
     end_ms: int | None,
     gap_threshold_ms: int | None = None,
     duplicate_policy: str = "all",
+    min_interval_ms: int | None = None,
 ) -> str:
-    """区间筛选、稳定排序、去重并序列化为 JSON Lines；无命中时返回空字符串。
+    """区间筛选、稳定排序、去重、抽样并序列化为 JSON Lines；无命中返回空串。
 
-    gap_threshold_ms 非 None 时为每条输出附加布尔字段 missing_before：
-    依据去重后的相邻输出记录，当前记录与上一条输出记录的 timestamp_ms
-    差值严格大于阈值时为 true；首条记录固定为 false，差值恰好等于阈值与
-    重复时间戳均为 false。区间外的样本和区间端点不参与判定。
+    先按闭区间筛选与重复点策略确定记录，再按 min_interval_ms 做最小间隔
+    抽样。gap_threshold_ms 非 None 时为每条输出附加布尔字段
+    missing_before：依据**抽样后**的相邻输出记录，当前记录与上一条输出
+    记录的 timestamp_ms 差值严格大于阈值时为 true；首条记录固定为
+    false，差值恰好等于阈值与重复时间戳均为 false。elapsed_ms 从抽样后
+    的首条记录计起。
     """
     records = select_records(records, start_ms, end_ms, duplicate_policy)
+    records = sample_min_interval(records, min_interval_ms)
 
     # 没有样本落入区间（或输入不含任何记录）：正常结束，标准输出为空。
     if not records:
@@ -447,8 +511,9 @@ def build_summary(
     start_ms: int | None,
     end_ms: int | None,
     duplicate_policy: str = "all",
+    min_interval_ms: int | None = None,
 ) -> dict[str, object]:
-    """对区间筛选与去重后的最终记录计算统计摘要。
+    """对区间筛选、去重与最小间隔抽样后的最终记录计算统计摘要。
 
     sample_count 为最终记录计数（all 下重复点分别计数，first/last 沿用
     源文件取完整样本的规则）；first_ms/last_ms 为最终记录最早、最晚时间
@@ -457,6 +522,7 @@ def build_summary(
     无选中记录时数量与跨度为 0，时间戳与各通道 min/max 均为 null。
     """
     records = select_records(records, start_ms, end_ms, duplicate_policy)
+    records = sample_min_interval(records, min_interval_ms)
     if not records:
         return {
             "sample_count": 0,
@@ -486,9 +552,12 @@ def render_summary(
     start_ms: int | None,
     end_ms: int | None,
     duplicate_policy: str = "all",
+    min_interval_ms: int | None = None,
 ) -> str:
     """返回摘要 JSON 字符串：唯一一个 JSON 对象加末尾换行。"""
-    summary = build_summary(records, start_ms, end_ms, duplicate_policy)
+    summary = build_summary(
+        records, start_ms, end_ms, duplicate_policy, min_interval_ms
+    )
     return json.dumps(summary, separators=(",", ":")) + "\n"
 
 
@@ -560,6 +629,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--min-interval-ms",
+        metavar="MS",
+        default=None,
+        help=(
+            "可选最小时间间隔抽样阈值（正十进制整数，允许前导零）：在闭"
+            "区间筛选与重复点策略确定的记录上，按时间升序保留时间戳组——"
+            "最早的时间戳组始终保留；其后某组与上一个保留组的 "
+            "timestamp_ms 差值至少为 MS 时才整体保留（恰好相等也保留）；"
+            "被跳过的组不改变比较基准，末组不足间隔时不强行保留。同一"
+            "时间戳的记录整体保留或跳过；抽样不生成新时间戳、不插值、不"
+            "平均，elapsed_ms 从抽样后的首条记录计起，missing_before 比较"
+            "抽样后的相邻输出记录。省略时保持全部既有行为"
+        ),
+    )
+    parser.add_argument(
         "--summary",
         action="store_true",
         default=False,
@@ -601,6 +685,21 @@ def parse_gap_threshold(token: str) -> int:
     return int(token)
 
 
+def parse_min_interval(token: str) -> int:
+    """校验 --min-interval-ms：仅 ASCII 数字组成且数值大于零。
+
+    允许前导零；缺值、空字符串、零、符号、空白、小数、指数或其他字符一律
+    拒绝（与 --gap-threshold-ms 相同的取值规则）。
+    """
+    option = "--min-interval-ms"
+    if not _TIMESTAMP_RE.match(token) or int(token) <= 0:
+        raise InputError(
+            f"{option} 参数非法（需数值大于零的十进制整数，不接受零、"
+            f"符号、小数、指数或空白）: {token!r}"
+        )
+    return int(token)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     path = Path(args.path)
@@ -628,6 +727,11 @@ def main(argv: list[str] | None = None) -> int:
         gap_threshold_ms = (
             parse_gap_threshold(args.gap_threshold_ms)
             if args.gap_threshold_ms is not None
+            else None
+        )
+        min_interval_ms = (
+            parse_min_interval(args.min_interval_ms)
+            if args.min_interval_ms is not None
             else None
         )
     except InputError as exc:
@@ -667,6 +771,7 @@ def main(argv: list[str] | None = None) -> int:
                 gap_threshold_ms,
                 args.duplicate_policy,
                 args.summary,
+                min_interval_ms,
             )
         else:
             output = replay_csv_text(
@@ -676,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
                 gap_threshold_ms,
                 args.duplicate_policy,
                 args.summary,
+                min_interval_ms,
             )
     except InputError as exc:
         if exc.line is not None:
