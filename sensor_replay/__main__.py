@@ -458,6 +458,29 @@ def sample_min_interval(
     return kept
 
 
+# 最终记录选择的统一入口：回放（render_records）与摘要（build_summary）
+# 都必须基于同一批最终记录，只在此处维护一次完整顺序，避免两条输出路径
+# 各自重复“筛选 → 排序 → 去重 → 抽样”的调用而产生漂移。
+def finalize_records(
+    records: list[tuple[int, int | float, int | float]],
+    start_ms: int | None,
+    end_ms: int | None,
+    duplicate_policy: str = "all",
+    min_interval_ms: int | None = None,
+) -> list[tuple[int, int | float, int | float]]:
+    """确定两种输出共用的最终记录：整文件校验后再筛选、排序、去重、抽样。
+
+    调用方负责先完成整文件校验（区间外或会被舍弃的非法记录已使输入失败）。
+    固定顺序为：闭区间筛选 → 按 timestamp_ms 稳定排序（重复时间戳保持源
+    文件先后）→ 按 duplicate_policy 去重（all 保留整组；first/last 分别只
+    保留同一时间戳在源文件中最先/最后出现的一条完整样本）→ 按
+    min_interval_ms 做最小间隔抽样（None 时不抽样，原样返回上一步结果）。
+    回放与摘要都以本函数返回的同一批记录为准。
+    """
+    records = select_records(records, start_ms, end_ms, duplicate_policy)
+    return sample_min_interval(records, min_interval_ms)
+
+
 def render_records(
     records: list[tuple[int, int | float, int | float]],
     start_ms: int | None,
@@ -466,17 +489,18 @@ def render_records(
     duplicate_policy: str = "all",
     min_interval_ms: int | None = None,
 ) -> str:
-    """区间筛选、稳定排序、去重、抽样并序列化为 JSON Lines；无命中返回空串。
+    """把最终记录序列化为 JSON Lines；无命中返回空串。
 
-    先按闭区间筛选与重复点策略确定记录，再按 min_interval_ms 做最小间隔
-    抽样。gap_threshold_ms 非 None 时为每条输出附加布尔字段
-    missing_before：依据**抽样后**的相邻输出记录，当前记录与上一条输出
-    记录的 timestamp_ms 差值严格大于阈值时为 true；首条记录固定为
-    false，差值恰好等于阈值与重复时间戳均为 false。elapsed_ms 从抽样后
-    的首条记录计起。
+    最终记录由两种输出共用的 finalize_records 确定（闭区间筛选、稳定排序、
+    去重与最小间隔抽样）。gap_threshold_ms 非 None 时为每条输出附加布尔
+    字段 missing_before：依据**最终**相邻输出记录，当前记录与上一条输出
+    记录的 timestamp_ms 差值严格大于阈值时为 true；首条记录固定为 false，
+    差值恰好等于阈值与重复时间戳均为 false。elapsed_ms 从最终首条记录
+    计起。
     """
-    records = select_records(records, start_ms, end_ms, duplicate_policy)
-    records = sample_min_interval(records, min_interval_ms)
+    records = finalize_records(
+        records, start_ms, end_ms, duplicate_policy, min_interval_ms
+    )
 
     # 没有样本落入区间（或输入不含任何记录）：正常结束，标准输出为空。
     if not records:
@@ -519,10 +543,12 @@ def build_summary(
     源文件取完整样本的规则）；first_ms/last_ms 为最终记录最早、最晚时间
     戳；duration_ms 为两者之差（不取参数边界）；temperature/humidity 各
     为只含 min/max 的对象，取最终记录的真实样本极值，不插值、不平均。
+    计数、跨度与极值来自与回放共用的同一批最终记录（finalize_records）。
     无选中记录时数量与跨度为 0，时间戳与各通道 min/max 均为 null。
     """
-    records = select_records(records, start_ms, end_ms, duplicate_policy)
-    records = sample_min_interval(records, min_interval_ms)
+    records = finalize_records(
+        records, start_ms, end_ms, duplicate_policy, min_interval_ms
+    )
     if not records:
         return {
             "sample_count": 0,
